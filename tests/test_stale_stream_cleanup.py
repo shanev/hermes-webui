@@ -381,6 +381,151 @@ def test_live_worker_past_ceiling_is_not_reaped_from_active_runs():
         config.unregister_active_run(live_stream_id)
 
 
+class _WedgedCancelSession:
+    def __init__(self, session_id, active_stream_id):
+        self.session_id = session_id
+        self.active_stream_id = active_stream_id
+        self.pending_user_message = None
+        self.pending_attachments = []
+        self.pending_started_at = None
+        self.messages = []
+        self.title = "Wedged Cancel"
+        self.worktree_path = None
+        self.workspace = None
+        self.model = None
+        self.model_provider = None
+
+    def save(self, *args, **kwargs):
+        return None
+
+
+def _start_successor(monkeypatch, tmp_path, session):
+    class NoopThread:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(routes.uuid, "uuid4", lambda: type("FakeUuid", (), {"hex": "new-stream"})())
+    monkeypatch.setattr(routes, "set_last_workspace", lambda workspace, **_kw: None)
+    monkeypatch.setattr(routes, "create_stream_channel", lambda: queue.Queue())
+    monkeypatch.setattr(routes.threading, "Thread", NoopThread)
+    return routes._start_chat_stream_for_session(
+        session,
+        msg="successor prompt",
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider=None,
+    )
+
+
+def _register_run(stream_id, session_id, *, phase, started_age, cancelled_age=None):
+    config.register_active_run(stream_id, session_id=session_id, phase=phase)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS[stream_id]["started_at"] = time.time() - started_age
+        if cancelled_age is not None:
+            config.ACTIVE_RUNS[stream_id]["cancelled_at"] = time.time() - cancelled_age
+
+
+def _reset_registries():
+    config.STREAMS.clear()
+    config.ACTIVE_RUNS.clear()
+    config.SESSION_AGENT_LOCKS.clear()
+
+
+def test_chat_start_admits_successor_after_wedged_cancel_past_grace(monkeypatch, tmp_path):
+    """A cancelled worker wedged in provider I/O never reaches its finally, so
+    its phase="cancelling" ACTIVE_RUNS row outlives the cancel indefinitely.
+    While the session still points at that stream, the active_stream_id guard
+    must stop blocking once the cancel is past the stale grace and clean up the
+    session + row, instead of 409ing until a server restart."""
+    _reset_registries()
+    old_stream_id = "wedged-cancel-stream"
+    session = _WedgedCancelSession("wedged-cancel-session", old_stream_id)
+    _register_run(old_stream_id, session.session_id, phase="cancelling",
+                  started_age=600, cancelled_age=routes._STALE_CANCELLED_RUN_GRACE_SECONDS + 30)
+    try:
+        response = _start_successor(monkeypatch, tmp_path, session)
+        assert "error" not in response
+        assert response["stream_id"] == "new-stream"
+        assert session.active_stream_id == "new-stream"
+        # The stale row is reconciled so the NEXT check is clean too.
+        assert old_stream_id not in config.ACTIVE_RUNS
+    finally:
+        config.unregister_active_run(old_stream_id)
+        routes.STREAMS.pop("new-stream", None)
+
+
+def test_chat_start_still_blocks_on_cancel_within_grace(monkeypatch, tmp_path):
+    _reset_registries()
+    old_stream_id = "fresh-cancel-stream"
+    session = _WedgedCancelSession("fresh-cancel-session", old_stream_id)
+    _register_run(old_stream_id, session.session_id, phase="cancelling",
+                  started_age=600, cancelled_age=5)
+    try:
+        response = _start_successor(monkeypatch, tmp_path, session)
+        assert response["_status"] == 409
+        assert response["active_stream_id"] == old_stream_id
+        assert session.active_stream_id == old_stream_id
+        assert old_stream_id in config.ACTIVE_RUNS
+        assert "new-stream" not in routes.STREAMS
+    finally:
+        config.unregister_active_run(old_stream_id)
+
+
+def test_chat_start_still_blocks_on_long_running_uncancelled_run(monkeypatch, tmp_path):
+    """Staleness applies only to cancels: a legitimately long turn that still
+    owns active_stream_id keeps blocking no matter how old it is."""
+    _reset_registries()
+    old_stream_id = "long-running-stream"
+    session = _WedgedCancelSession("long-running-session", old_stream_id)
+    _register_run(old_stream_id, session.session_id, phase="running", started_age=600)
+    try:
+        response = _start_successor(monkeypatch, tmp_path, session)
+        assert response["_status"] == 409
+        assert response["active_stream_id"] == old_stream_id
+        assert old_stream_id in config.ACTIVE_RUNS
+    finally:
+        config.unregister_active_run(old_stream_id)
+
+
+def test_cleared_stream_id_wedged_cancel_uses_stale_grace_not_run_ceiling(monkeypatch, tmp_path):
+    """With active_stream_id already cleared by cancel_stream(), the ACTIVE_RUNS
+    session guard applies the same stale-cancel grace (not the 180s run
+    ceiling), so all chat/start paths agree on when a wedged cancel is dead."""
+    _reset_registries()
+    old_stream_id = "cleared-wedged-cancel-stream"
+    session = _WedgedCancelSession("cleared-wedged-cancel-session", None)
+    _register_run(old_stream_id, session.session_id, phase="cancelling",
+                  started_age=600, cancelled_age=routes._STALE_CANCELLED_RUN_GRACE_SECONDS + 30)
+    try:
+        response = _start_successor(monkeypatch, tmp_path, session)
+        assert "error" not in response
+        assert response["stream_id"] == "new-stream"
+        assert old_stream_id not in config.ACTIVE_RUNS
+    finally:
+        config.unregister_active_run(old_stream_id)
+        routes.STREAMS.pop("new-stream", None)
+
+
+def test_cleared_stream_id_uncancelled_run_keeps_180s_ceiling(monkeypatch, tmp_path):
+    _reset_registries()
+    old_stream_id = "cleared-running-stream"
+    session = _WedgedCancelSession("cleared-running-session", None)
+    _register_run(old_stream_id, session.session_id, phase="running",
+                  started_age=routes._STALE_CANCELLED_RUN_GRACE_SECONDS + 30)
+    try:
+        response = _start_successor(monkeypatch, tmp_path, session)
+        assert response["_status"] == 409
+        assert response["active_stream_id"] == old_stream_id
+        assert old_stream_id in config.ACTIVE_RUNS
+    finally:
+        config.unregister_active_run(old_stream_id)
+
+
 def test_stale_stream_cleanup_does_not_clobber_concurrent_chat_start(monkeypatch):
     """Regression for #1533: stale cleanup must not erase a new stream id.
 
