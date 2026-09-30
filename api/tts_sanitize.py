@@ -109,12 +109,9 @@ def _terminated(text: str) -> str:
 
 
 def _code_note(code_blocks: int, dropped_inline: int) -> str:
-    if code_blocks == 1:
-        return "There is a code block in the chat transcript."
-    if code_blocks > 1:
-        return f"There are {code_blocks} code blocks in the chat transcript."
-    if dropped_inline:
-        return "There is code in the chat transcript."
+    # Policy (user directive): never announce code — read it. Code content is
+    # kept inline by _strip_fenced_code/_strip_inline, so there is nothing to
+    # announce.
     return ""
 
 
@@ -143,7 +140,7 @@ def _scan_fences(text: str) -> _Fences:
                 spans.append((start, line_end))
             else:
                 lines.append(line)
-            out.append("")
+                out.append(line)
             offset = line_end + 1
             continue
         if fence is None:
@@ -181,6 +178,9 @@ def _scan_fences(text: str) -> _Fences:
             kept.append(line[pos:])
         elif not opened_here:
             lines.append(line)  # an opening line's remainder is its info string
+            # Content stays speakable: read, not announced. Underscores become
+            # spaces so the voice says "my func name", not "my underscore func".
+            kept.append(line[pos or 0:].replace("_", " "))
         out.append(" ".join(kept))
         offset = line_end + 1
     if fence is not None:
@@ -314,8 +314,8 @@ def _strip_inline(text: str) -> tuple[str, int]:
             # Route-like span ("/api/models"): speak it with slashes as
             # spaces rather than dropping the referent entirely.
             return " ".join(part for part in code.split("/") if part)
-        dropped += 1
-        return " "
+        # Policy: read code, never announce it. Keep the raw span content.
+        return " ".join(code.replace("_", " ").split())
 
     text = _CODE_SPAN_RE.sub(code_span, text)
     text = _SOFT_ESCAPE_RE.sub("", text)

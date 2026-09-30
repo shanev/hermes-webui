@@ -106,13 +106,14 @@ def test_short_whole_reply_code_is_spoken_on_voice_stream(monkeypatch, tokens, s
     assert spoken_inputs(monkeypatch, tokens) == spoken
 
 
-def test_streamed_code_block_is_announced_once_after_prose(monkeypatch):
+def test_streamed_code_block_is_read_once_after_prose(monkeypatch):
     tokens = ['Run this:\n', '```python\n', 'def add(a, b):\n',
               '    return a + b. \n', '```\n', 'That adds them.']
     spoken = spoken_inputs(monkeypatch, tokens)
-    assert ' '.join(spoken).count('in the chat transcript') == 1
-    assert not any('return' in text for text in spoken)
-    assert spoken[-1].endswith('That adds them.')
+    # The block is held whole (never cut at its inner sentence ends) and read.
+    assert spoken == ['Run this:', 'def add(a, b):\nreturn a + b.', 'That adds them.']
+    assert ' '.join(spoken).count('return a + b') == 1
+    assert 'chat transcript' not in ' '.join(spoken)
 
 
 def test_deadline_never_flushes_an_open_block():

@@ -1,8 +1,8 @@
 """Speech sanitization for /api/tts (``api/tts_sanitize.py``).
 
 Reply text is written for a chat surface. These tests pin what an engine is
-asked to speak: prose only, markdown syntax gone, code never read aloud, and
-the 5000-char cap applied to the sanitized text. Engine dispatch is mocked at
+asked to speak: markdown syntax gone, code read aloud rather than announced,
+and the 5000-char cap applied to the sanitized text. Engine dispatch is mocked at
 the same points the other TTS suites use (the ``edge_tts`` module and
 ``routes._tts_open``); no network and no real synthesis.
 """
@@ -19,8 +19,6 @@ import api.voice as voice
 from api.tts_sanitize import sanitize, speech_text
 
 
-BLOCK_NOTE = "There is a code block in the chat transcript."
-INLINE_NOTE = "There is code in the chat transcript."
 TURN_ID = "vt_" + "a" * 32
 
 FENCED = (
@@ -49,7 +47,7 @@ MARKDOWN_REPLY = (
     "## Result\n\nUse the **bold** move, see [the docs](https://example.com/docs).\n\n"
     "```py\nx = 1\n```"
 )
-SPOKEN_REPLY = "Result.\nUse the bold move, see the docs. " + BLOCK_NOTE
+SPOKEN_REPLY = "Result.\nUse the bold move, see the docs.\nx = 1"
 
 
 # ── plain text ──────────────────────────────────────────────────────────────
@@ -128,24 +126,27 @@ def test_images_and_urls_are_described_not_spelled_out():
 # ── code ────────────────────────────────────────────────────────────────────
 
 
-def test_fenced_code_is_replaced_by_the_transcript_note():
+def test_fenced_code_content_is_spoken():
     result = sanitize(FENCED)
 
-    assert result.text == "Here is the function:\nCall it with two numbers."
-    assert result.code_note == BLOCK_NOTE
+    assert result.text == (
+        "Here is the function:\ndef add(a, b):\nreturn a + b\nCall it with two numbers."
+    )
+    assert result.code_note == ""
     assert result.code_blocks == 1
-    assert result.spoken() == "Here is the function:\nCall it with two numbers. " + BLOCK_NOTE
-    assert speech_text(FENCED) == (result.text, BLOCK_NOTE)
-    for leaked in ("def add", "return", "python", "`"):
+    assert result.spoken() == result.text
+    assert speech_text(FENCED) == (result.text, "")
+    # The info string and fence markers are syntax, not code.
+    for leaked in ("python", "`", "chat transcript"):
         assert leaked not in result.spoken()
 
 
-def test_tilde_and_unclosed_fences_are_counted_and_never_spoken():
+def test_tilde_and_unclosed_fences_are_counted_and_spoken():
     result = sanitize("Intro.\n~~~\nsecret = 1\n~~~\nMiddle.\n```js\nlet hidden = 2;")
 
-    assert result.text == "Intro.\nMiddle."
+    assert result.text == "Intro.\nsecret = 1\nMiddle.\nlet hidden = 2;"
     assert result.code_blocks == 2
-    assert result.code_note == "There are 2 code blocks in the chat transcript."
+    assert result.code_note == ""
 
 
 def test_a_fence_inside_a_line_is_still_a_code_block():
@@ -155,30 +156,34 @@ def test_a_fence_inside_a_line_is_still_a_code_block():
     assert result.code_blocks == 1
 
 
-def test_a_reply_that_is_only_code_speaks_only_the_note():
+def test_a_reply_that_is_only_code_speaks_the_code():
     result = sanitize("```\nx = 1\n```")
 
-    assert result.text == ""
-    assert result.spoken() == BLOCK_NOTE
+    assert result.text == "x = 1"
+    assert result.code_note == ""
+    assert result.spoken() == "x = 1"
 
 
-def test_inline_code_speaks_short_identifiers_and_drops_the_rest():
+def test_inline_code_is_spoken_whatever_its_shape():
     result = sanitize(INLINE)
 
-    assert result.text == "Call my func then os.path.join and run now."
-    assert result.code_note == INLINE_NOTE
-    assert result.code_blocks == 0
-    assert "subprocess" not in result.spoken()
-
-
-def test_long_identifiers_are_dropped():
-    assert speech_text("Set `this_identifier_is_far_too_long` first.") == (
-        "Set first.",
-        INLINE_NOTE,
+    assert result.text == (
+        "Call my func then os.path.join and run "
+        "subprocess.run(['ls', '-la'], check=True) now."
     )
-    # The limit is 20 characters, inclusive.
+    assert result.code_note == ""
+    assert result.code_blocks == 0
+    assert "`" not in result.spoken()
+
+
+def test_long_identifiers_are_spoken():
+    assert speech_text("Set `this_identifier_is_far_too_long` first.") == (
+        "Set this identifier is far too long first.",
+        "",
+    )
+    # Either side of the old 20-character identifier limit is spoken the same.
     assert speech_text("`" + "a" * 20 + "`") == ("a" * 20, "")
-    assert speech_text("`" + "a" * 21 + "`") == ("", INLINE_NOTE)
+    assert speech_text("`" + "a" * 21 + "`") == ("a" * 21, "")
 
 
 # ── tables, entities, whitespace ────────────────────────────────────────────
@@ -307,7 +312,8 @@ def test_tts_engine_receives_the_sanitized_text(engine_text):
     assert handler.status == 200
     assert handler.sent_headers.get("Content-Type") == "audio/mpeg"
     assert engine_text == [SPOKEN_REPLY]
-    assert "x = 1" not in engine_text[0]
+    assert "x = 1" in engine_text[0]
+    assert "chat transcript" not in engine_text[0]
 
 
 def test_tts_sanitizes_before_the_elevenlabs_engine_too(monkeypatch):
@@ -344,11 +350,11 @@ def test_tts_sanitizes_before_the_elevenlabs_engine_too(monkeypatch):
     assert captured["body"]["text"] == SPOKEN_REPLY
 
 
-def test_tts_speaks_only_the_note_for_a_code_only_reply(engine_text):
+def test_tts_speaks_the_code_of_a_code_only_reply(engine_text):
     handler = _tts("```\nx = 1\n```", "10.77.0.3")
 
     assert handler.status == 200
-    assert engine_text == [BLOCK_NOTE]
+    assert engine_text == ["x = 1"]
 
 
 def test_tts_logs_the_code_block_metric_for_a_voice_turn(engine_text, log_lines):
@@ -390,7 +396,7 @@ def test_tts_cap_applies_to_the_sanitized_text(engine_text):
     at_cap = _tts("x" * 5000, "10.77.1.1")
     over_cap = _tts("x" * 5001, "10.77.1.2")
     # Markup does not count: raw text over the cap that speaks short is fine...
-    raw = "Summary first.\n\n```\n" + "y = 2\n" * 1000 + "```"
+    raw = "Summary first. See [the docs](https://example.com/" + "a" * 5000 + ")."
     shrunk = _tts(raw, "10.77.1.3")
     # ...and markup cannot smuggle over-long speech past it.
     still_long = _tts("# " + "x" * 5001, "10.77.1.4")
@@ -402,15 +408,24 @@ def test_tts_cap_applies_to_the_sanitized_text(engine_text):
     assert shrunk.status == 200
     assert still_long.status == 400
     assert "too long" in still_long.payload()["error"]
-    assert engine_text == ["x" * 5000, "Summary first. " + BLOCK_NOTE]
+    assert engine_text == ["x" * 5000, "Summary first. See the docs."]
 
 
-def test_tts_cap_counts_the_code_note(engine_text):
-    handler = _tts("x" * 4990 + "\n```\ncode\n```", "10.77.1.5")
+def test_tts_cap_counts_spoken_code(engine_text):
+    # Fenced code is read aloud, so its content counts toward the cap: a big
+    # block no longer shrinks to a short note.
+    code_heavy = _tts("Summary first.\n\n```\n" + "y = 2\n" * 1000 + "```", "10.77.1.5")
+    # Prose + "\n" + "code" lands exactly on the cap...
+    at_cap = _tts("x" * 4995 + "\n```\ncode\n```", "10.77.1.8")
+    # ...and one more character of prose tips it over.
+    over_cap = _tts("x" * 4996 + "\n```\ncode\n```", "10.77.1.9")
 
-    assert handler.status == 400
-    assert "too long" in handler.payload()["error"]
-    assert engine_text == []
+    assert code_heavy.status == 400
+    assert "too long" in code_heavy.payload()["error"]
+    assert at_cap.status == 200
+    assert over_cap.status == 400
+    assert "too long" in over_cap.payload()["error"]
+    assert engine_text == ["x" * 4995 + "\ncode"]
 
 
 def test_tts_bounds_raw_text_before_sanitizing(monkeypatch, engine_text):
@@ -451,19 +466,26 @@ def test_whole_reply_fenced_identifier_underscores_become_spaces():
     assert sanitize("```text\nmy_func_name\n```").spoken() == "my func name"
 
 
-def test_code_note_stays_for_code_inside_prose():
+def test_code_inside_prose_is_spoken():
     result = sanitize("Use `git rebase` to fix it.")
-    assert "There is code" in result.spoken()
+    assert result.code_note == ""
+    assert result.spoken() == "Use git rebase to fix it."
+    assert sanitize("use `git rebase --onto` carefully").spoken() == (
+        "use git rebase --onto carefully")
 
 
-def test_code_note_stays_for_multiline_fenced_block():
+def test_multiline_fenced_block_is_read():
     result = sanitize("```python\ndef add(a, b):\n    return a + b\n```")
-    assert "There is a code block" in result.spoken()
+    assert result.code_note == ""
+    assert result.code_blocks == 1
+    assert result.spoken() == "def add(a, b):\nreturn a + b"
 
 
-def test_code_note_stays_when_fence_has_surrounding_prose():
+def test_fenced_block_with_surrounding_prose_is_read():
     result = sanitize("```text\nlocalStorage\n```\nUse that.")
-    assert "There is a code block" in result.spoken()
+    assert result.code_note == ""
+    assert result.code_blocks == 1
+    assert result.spoken() == "localStorage\nUse that."
 
 
 def test_path_like_code_span_is_spoken_not_dropped():
@@ -484,10 +506,11 @@ def test_whole_reply_one_line_fence_is_spoken():
     assert sanitize("~~~\napi\n~~~").spoken() == "api"
 
 
-def test_whole_reply_block_with_two_lines_is_announced_not_truncated():
+def test_whole_reply_block_with_two_lines_is_read_in_full():
     # Speaking only the first line would silently drop the second.
-    assert sanitize("```\napi\nmodels\n```").spoken() == (
-        "There is a code block in the chat transcript.")
+    result = sanitize("```\napi\nmodels\n```")
+    assert result.code_note == ""
+    assert result.spoken() == "api\nmodels"
 
 
 def test_fenced_spans_cover_blocks_and_an_unclosed_tail():
