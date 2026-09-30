@@ -76,7 +76,9 @@ INTERRUPT_NOTE = (
 VOICE_MODE_NOTE = (
     "[System note: This reply will be spoken aloud. Use plain prose: no markdown "
     "formatting, no code blocks, no tables, no URLs (describe links in words). "
-    "Keep paragraphs short. Keep the reply under about 100 words unless the user "
+    "Keep paragraphs short. Prefer several short sentences over one long one — "
+    "vary rhythm but avoid sentences longer than about 25 words. "
+    "Keep the reply under about 100 words unless the user "
     "asks for more detail — spoken replies much longer than that are exhausting. "
     "If code is essential, briefly describe it in words "
     "and note that the full code is in the chat transcript.]"

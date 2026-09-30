@@ -317,6 +317,13 @@ def test_voice_mode_note_includes_brevity_cap():
     assert "100 words" in voice.VOICE_MODE_NOTE
 
 
+def test_voice_mode_note_includes_sentence_hygiene():
+    # Per-sentence TTS synthesizes one sentence at a time: a very long sentence
+    # after a short one leaves the client silent while it synthesizes.
+    assert "several short sentences over one long one" in voice.VOICE_MODE_NOTE
+    assert "25 words" in voice.VOICE_MODE_NOTE
+
+
 def test_metric_event_validation_rejects_non_objects():
     assert voice.validate_metric_event(["playback_start"]) == (None, "JSON object required")
 
