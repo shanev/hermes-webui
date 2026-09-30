@@ -281,7 +281,7 @@ def test_chat_start_binds_the_voice_turn_to_the_accepted_stream():
 # ── POST /api/voice/metrics ─────────────────────────────────────────────────
 
 
-def _valid_metric(turn_id, **overrides):
+def _valid_metric(turn_id="vt_" + "a" * 32, **overrides):
     event = {"session_id": SID, "turn_id": turn_id, "stage": "playback_start", "ts": NOW_MS}
     event.update(overrides)
     return event
@@ -304,7 +304,8 @@ def _valid_metric(turn_id, **overrides):
     ],
 )
 def test_metric_event_validation_rejects_bad_fields(overrides, error):
-    event, invalid = voice.validate_metric_event(_valid_metric("vt_" + "a" * 32, **overrides))
+    turn_id = overrides.pop("turn_id", "vt_" + "a" * 32)
+    event, invalid = voice.validate_metric_event(_valid_metric(turn_id, **overrides))
 
     assert event is None
     assert invalid == error
