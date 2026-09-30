@@ -32,6 +32,9 @@ MAX_INPUT_CHARS = 50_000
 _MAX_IDENTIFIER_CHARS = 20
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_.]{1,%d}" % _MAX_IDENTIFIER_CHARS)
 
+# Lines captured from fenced blocks by the most recent _strip_fenced_code call.
+FENCED_BLOCK_LINES: list[str] = []
+
 _BACKTICK_FENCE_RE = re.compile(r"`{3,}")
 _QUOTE_PREFIX = r"[ \t]*(?:>[ \t]*)*"
 # A tilde fence must own its line; "~~~struck~~~ text" is not a fence.
@@ -116,7 +119,11 @@ def _code_note(code_blocks: int, dropped_inline: int) -> str:
 
 
 def _strip_fenced_code(text: str) -> tuple[str, int]:
-    """Remove fenced code blocks. Returns ``(text, block_count)``."""
+    """Remove fenced code blocks. Returns ``(text, block_count)``.
+    Captured block lines accumulate in FENCED_BLOCK_LINES (module-level, reset
+    per call) so sanitize() can speak a trivial block instead of announcing it."""
+    global FENCED_BLOCK_LINES
+    FENCED_BLOCK_LINES = []
     out = []
     count = 0
     fence = None  # (fence character, run length) while inside a block
@@ -150,6 +157,8 @@ def _strip_fenced_code(text: str) -> tuple[str, int]:
                 pos = match.end()
         if fence is None:
             kept.append(line[pos:])
+        else:
+            FENCED_BLOCK_LINES.append(line)
         out.append(" ".join(kept))
     return "\n".join(out), count
 
@@ -310,7 +319,34 @@ def sanitize(text) -> SpeechText:
     text, dropped_inline = _strip_inline(text)
     text = _ENTITY_RE.sub(lambda match: html.unescape(match.group()), text)
     text = _collapse_whitespace(text)
+    text, code_blocks, dropped_inline = _speak_trivial_code(
+        text, code_blocks, dropped_inline)
     return SpeechText(text, _code_note(code_blocks, dropped_inline), code_blocks)
+
+
+def _speak_trivial_code(text, code_blocks, dropped_inline):
+    """When code IS essentially the whole reply and is short identifier-like
+    text, speak it instead of announcing it. A one-word answer like
+    ``localStorage`` should be heard, not summarized."""
+    if not code_blocks and not dropped_inline:
+        return text, code_blocks, dropped_inline
+    words = text.split(" ") if text else []
+    if len(words) > 2:
+        return text, code_blocks, dropped_inline
+    # The remaining prose is at most two words — the reply was the code.
+    if len(text) <= _MAX_IDENTIFIER_CHARS and _IDENTIFIER_RE.fullmatch(text):
+        return text, 0, 0  # spoken directly; no note
+    # Whole-reply fenced block: speak its single identifier-like line.
+    if not text.strip() and code_blocks == 1:
+        candidate = next(
+            (line.strip() for line in FENCED_BLOCK_LINES
+             if line.strip() and not line.strip().startswith("`")),
+            "")
+        if candidate and len(candidate) <= _MAX_IDENTIFIER_CHARS \
+                and _IDENTIFIER_RE.fullmatch(candidate):
+            # Underscores become spaces so the engine says "my func".
+            return " ".join(candidate.replace("_", " ").split()), 0, 0
+    return text, code_blocks, dropped_inline
 
 
 def speech_text(text: str) -> tuple[str, str]:

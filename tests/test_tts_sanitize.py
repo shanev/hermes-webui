@@ -432,3 +432,35 @@ def test_tts_rejects_text_with_nothing_speakable(engine_text):
     assert handler.status == 400
     assert handler.payload() == {"error": "no speakable text"}
     assert engine_text == []
+
+
+# --- Trivial code replies are spoken, not announced (issue #5) ---
+
+
+def test_whole_reply_inline_code_span_is_spoken():
+    assert sanitize("`localStorage`").spoken() == "localStorage"
+
+
+def test_whole_reply_single_word_fenced_block_is_spoken():
+    result = sanitize("```text\nlocalStorage\n```")
+    assert result.spoken() == "localStorage"
+    assert result.code_note == ""
+
+
+def test_whole_reply_fenced_identifier_underscores_become_spaces():
+    assert sanitize("```text\nmy_func_name\n```").spoken() == "my func name"
+
+
+def test_code_note_stays_for_code_inside_prose():
+    result = sanitize("Use `git rebase` to fix it.")
+    assert "There is code" in result.spoken()
+
+
+def test_code_note_stays_for_multiline_fenced_block():
+    result = sanitize("```python\ndef add(a, b):\n    return a + b\n```")
+    assert "There is a code block" in result.spoken()
+
+
+def test_code_note_stays_when_fence_has_surrounding_prose():
+    result = sanitize("```text\nlocalStorage\n```\nUse that.")
+    assert "There is a code block" in result.spoken()
