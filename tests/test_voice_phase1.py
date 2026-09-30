@@ -311,6 +311,12 @@ def test_metric_event_validation_rejects_bad_fields(overrides, error):
     assert invalid == error
 
 
+def test_voice_mode_note_includes_brevity_cap():
+    # The spoken-reply length cap is part of the voice contract: without it the
+    # model produces multi-minute audio for casual questions.
+    assert "100 words" in voice.VOICE_MODE_NOTE
+
+
 def test_metric_event_validation_rejects_non_objects():
     assert voice.validate_metric_event(["playback_start"]) == (None, "JSON object required")
 
