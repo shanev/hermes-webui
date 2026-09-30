@@ -11955,12 +11955,12 @@ def _run_agent_streaming(
                 session_id,
                 pending_async_acceptances=_pending_async_acceptances,
             )
-            # Barge-in: a one-shot note armed by POST /api/voice/interrupt rides
-            # the same model-only prefix as process notifications, so the
-            # persisted/displayed user message stays the clean msg_text.
-            _voice_interrupt_note = _voice.consume_interrupt_note(session_id)
-            if _voice_interrupt_note:
-                _process_notifications.insert(0, _voice_interrupt_note)
+            # Voice turn notes — the barge-in note armed by POST
+            # /api/voice/interrupt and the spoken-output directive armed for a
+            # voice-originated turn — ride the same model-only prefix as
+            # process notifications, so the persisted/displayed user message
+            # stays the clean msg_text.
+            _process_notifications[:0] = _voice.consume_turn_notes(session_id, stream_id)
             _agent_msg_text = msg_text
             if _process_notifications:
                 _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()

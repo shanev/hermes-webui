@@ -68,9 +68,10 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       startup.py           Startup helpers: auto_install_agent_deps()
       state_sync.py        /insights sync — message_count to the agent's state.db
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
+      tts_sanitize.py      Speech-text normalization for /api/tts (markdown/code -> prose)
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
-      voice.py             Voice-turn stage timing log + barge-in interrupt note (in-memory)
+      voice.py             Voice-turn stage timing log + one-shot turn notes: barge-in, voice mode (in-memory)
       workspace.py         File ops: list_dir, read_file_content, git detection, workspace helpers
     static/
       index.html           HTML template
@@ -1546,8 +1547,26 @@ barge-in, or once the turn is 120 s old.
                                voice turn (stages transcribe_start, transcribe_done).
     /api/chat/start            Optional "voice_turn_id": binds the accepted stream to the turn
                                (stages first_token, first_sentence from the reply stream).
+                               A well-formed voice_turn_id also marks the turn as spoken:
+                               the model's copy of that one user turn is prefixed with a
+                               one-shot, model-only directive to answer in plain prose
+                               (no markdown, code blocks, tables or URLs). It is armed
+                               for the accepted stream before its worker starts and
+                               drained with the barge-in note below — interrupt note
+                               first, then the directive, then the message — on local
+                               and Gateway turns alike. Never persisted; the stored
+                               user message stays clean. Typed turns and regenerations
+                               carry no directive.
     /api/tts                   Optional "turn_id": stamps tts_first_byte when the first
-                               sentence's audio is ready to send.
+                               sentence's audio is ready to send. "text" is sanitized
+                               for speech before any engine sees it (api/tts_sanitize.py):
+                               markdown syntax is stripped, table rows become sentences,
+                               URLs become "link to <host>", and code is never spoken — a
+                               closing sentence says it is in the chat transcript. The
+                               5000-char cap applies to the sanitized text (raw text is
+                               bounded at 50000); text with nothing speakable -> 400.
+                               With "turn_id", one `voice_tts_sanitize` log line carries
+                               code_blocks, spoken_chars, original_chars.
     /api/voice/metrics         {"session_id", "turn_id", "stage", "ts"} -> {"ok", "recorded",
                                "turn_id", "stage"}. Client-observed stages (playback_start).
                                stage must be one of the six stage names; ts is epoch ms;

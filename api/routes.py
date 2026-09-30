@@ -11282,6 +11282,7 @@ from api.streaming import (
     _CompactEchoIndex,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
+from api import tts_sanitize as _tts_sanitize
 from api import voice as _voice
 from api.run_journal import (
     runtime_model_from_events,
@@ -20768,7 +20769,21 @@ def _handle_tts(handler, parsed):
     if not text:
         from api.helpers import bad as _bad
         return _bad(handler, "text is required", 400)
-    if len(text) > 5000:
+    if len(text) > _tts_sanitize.MAX_INPUT_CHARS:
+        from api.helpers import bad as _bad
+        return _bad(handler, "text too long (max 5000 characters)", 400)
+
+    # Speak prose, not syntax: markdown is stripped and code is left out (the
+    # listener is told it is in the chat transcript). Sanitized once, here, so
+    # every engine below receives the same text; the 5000-char cap applies to
+    # what is actually synthesized.
+    original_chars = len(text)
+    speech = _tts_sanitize.sanitize(text)
+    text = speech.spoken()
+    if not text:
+        from api.helpers import bad as _bad
+        return _bad(handler, "no speakable text", 400)
+    if len(text) > _tts_sanitize.MAX_SPEECH_CHARS:
         from api.helpers import bad as _bad
         return _bad(handler, "text too long (max 5000 characters)", 400)
 
@@ -20825,6 +20840,14 @@ def _handle_tts(handler, parsed):
         logger.warning("TTS rate limit hit for client=%s", limiter._get_client_key(handler))
         from api.helpers import bad as _bad
         return _bad(handler, "rate limit exceeded — please wait", 429)
+
+    # Counts only, and only for an admitted request that names a voice turn.
+    _voice.record_tts_sanitize(
+        voice_turn_id,
+        code_blocks=speech.code_blocks,
+        spoken_chars=len(text),
+        original_chars=original_chars,
+    )
 
     # ── ElevenLabs TTS ──────────────────────────────────────────────────
     if engine == "elevenlabs":
@@ -24103,6 +24126,7 @@ def _start_chat_stream_for_session(
     moa_config=None,
     external_runtime_owned: bool | None = None,
     regeneration=None,
+    voice_mode: bool = False,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     if external_runtime_owned is None:
@@ -24253,6 +24277,11 @@ def _start_chat_stream_for_session(
     if backend_is_gateway:
         from api.gateway_chat import _mark_gateway_run_starting
         _mark_gateway_run_starting(stream_id)
+    # Voice-originated turn: arm the spoken-output directive for this stream
+    # before its worker exists, so the worker's one-shot note drain sees it.
+    # Bound to stream_id: if this turn never drains it, no later turn can.
+    if voice_mode:
+        _voice.arm_voice_mode_note(s.session_id, stream_id)
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
@@ -24354,6 +24383,7 @@ def _start_run(
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
     regeneration=None,
+    voice_mode: bool = False,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -24381,6 +24411,10 @@ def _start_run(
         runtime_adapter_runner_enabled,
     )
 
+    # Passed through only for a voice-originated turn; every other start keeps
+    # its existing call shape.
+    voice_kwargs = {"voice_mode": True} if voice_mode else {}
+
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
         if regeneration is not None and runtime_adapter_runner_enabled():
             return {"error": "Regeneration is not supported by the runner backend.", "code": "unsupported_regeneration_backend", "_status": 409}
@@ -24398,6 +24432,7 @@ def _start_run(
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
+                **voice_kwargs,
             )
 
         def _legacy_adapter_factory():
@@ -24440,6 +24475,7 @@ def _start_run(
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
+        **voice_kwargs,
     )
 
 
@@ -25384,6 +25420,11 @@ def _handle_chat_start(handler, body, diag=None):
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
+        # A turn that names a voice turn (the turn_id from /api/transcribe) will
+        # be spoken: ask for speech-friendly output on this turn only. A
+        # regeneration replays an earlier turn and is never voice-originated.
+        if regeneration is None and _voice.is_turn_id(body.get("voice_turn_id")):
+            start_run_kwargs["voice_mode"] = True
         recovery_cleared_for_start = None
         def _restore_cleared_recovery():
             if recovery_cleared_for_start is None:

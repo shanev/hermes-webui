@@ -9,7 +9,8 @@ log.
 State layer: process-local, in-memory, bounded. Nothing here is persisted and
 nothing here is authoritative for run state — cancellation stays in
 ``api.streaming.cancel_stream`` and the active-run registry. A restart drops
-open turns and armed interrupt notes; both degrade to "no instrumentation".
+open turns and armed turn notes (the barge-in note and the voice-mode
+directive); both degrade to "no instrumentation" and a chat-formatted reply.
 
 Privacy: records carry ids, stage names, timestamps and character counts only.
 Reply text passes through ``note_reply_text`` solely to find the first sentence
@@ -70,6 +71,14 @@ INTERRUPT_NOTE = (
     "[System note: the previous spoken reply was interrupted by the user before "
     "it finished playing; they may not have heard all of it.]"
 )
+# Armed by /api/chat/start for a voice-originated turn. It rides the same
+# one-shot, model-only note drain as INTERRUPT_NOTE.
+VOICE_MODE_NOTE = (
+    "[System note: This reply will be spoken aloud. Use plain prose: no markdown "
+    "formatting, no code blocks, no tables, no URLs (describe links in words). "
+    "Keep paragraphs short. If code is essential, briefly describe it in words "
+    "and note that the full code is in the chat transcript.]"
+)
 _NOTE_TTL_SECONDS = 900.0
 _MAX_NOTES = 1024
 
@@ -85,6 +94,9 @@ _TURNS: "OrderedDict[str, dict]" = OrderedDict()  # turn_id -> record, oldest fi
 # Read lock-free on the per-token hot path; written under _LOCK.
 _AWAITING_REPLY: dict = {}
 _INTERRUPT_NOTES: "OrderedDict[str, float]" = OrderedDict()  # session_id -> armed_at
+# session_id -> (stream_id, armed_at). Bound to the stream it was armed for, so
+# a turn that never drained it cannot hand the directive to a later turn.
+_VOICE_MODE_NOTES: "OrderedDict[str, tuple]" = OrderedDict()
 
 
 def now_ms() -> int:
@@ -287,6 +299,25 @@ def mark_stage(turn_id, stage: str) -> bool:
     return True
 
 
+def record_tts_sanitize(turn_id, *, code_blocks, spoken_chars, original_chars) -> bool:
+    """Log what speech sanitization did to one TTS request of a voice turn.
+
+    Counts only. A request without a well-formed turn_id logs nothing; the turn
+    need not still be open, since per-sentence TTS outlives its log line.
+    """
+    if not is_turn_id(turn_id):
+        return False
+    _emit([_log_line({
+        "event": "voice_tts_sanitize",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "turn_id": turn_id,
+        "code_blocks": int(code_blocks),
+        "spoken_chars": int(spoken_chars),
+        "original_chars": int(original_chars),
+    })])
+    return True
+
+
 def validate_metric_event(payload):
     """Validate a POST /api/voice/metrics body. Returns ``(event, error)``."""
     if not isinstance(payload, dict):
@@ -383,16 +414,35 @@ def record_interrupt(session_id, turn_id, *, truncated_chars: int, cancelled: bo
     _emit(lines)
 
 
+def _arm_note_locked(notes: OrderedDict, session_id: str, value) -> None:
+    """Arm (or re-arm) a session's note, newest last. Caller holds _LOCK."""
+    notes.pop(session_id, None)
+    notes[session_id] = value
+    while len(notes) > _MAX_NOTES:
+        notes.popitem(last=False)
+
+
 def arm_interrupt_note(session_id) -> None:
     """Remember that this session's spoken reply was interrupted."""
     session_id = str(session_id or "").strip()
     if not session_id:
         return
     with _LOCK:
-        _INTERRUPT_NOTES.pop(session_id, None)
-        _INTERRUPT_NOTES[session_id] = time.time()
-        while len(_INTERRUPT_NOTES) > _MAX_NOTES:
-            _INTERRUPT_NOTES.popitem(last=False)
+        _arm_note_locked(_INTERRUPT_NOTES, session_id, time.time())
+
+
+def arm_voice_mode_note(session_id, stream_id) -> None:
+    """Ask for a speech-friendly reply on the voice turn that owns ``stream_id``.
+
+    Call before the turn's worker starts; the worker drains it with
+    ``consume_turn_notes``. Arming never touches an armed interrupt note.
+    """
+    session_id = str(session_id or "").strip()
+    stream_id = str(stream_id or "").strip()
+    if not session_id or not stream_id:
+        return
+    with _LOCK:
+        _arm_note_locked(_VOICE_MODE_NOTES, session_id, (stream_id, time.time()))
 
 
 def consume_interrupt_note(session_id):
@@ -406,10 +456,39 @@ def consume_interrupt_note(session_id):
     return INTERRUPT_NOTE
 
 
-def prepend_interrupt_note(session_id, text: str) -> str:
-    """Prefix ``text`` with the armed interrupt note, consuming it."""
-    note = consume_interrupt_note(session_id)
-    return f"{note}\n\n{text}" if note else text
+def consume_turn_notes(session_id, stream_id=None) -> list:
+    """Drain the one-shot, model-only notes for the turn running on ``stream_id``.
+
+    Returns the armed notes in delivery order: the interrupt note (about the
+    previous reply), then the voice-mode directive (about this one). The
+    directive is released only to the stream it was armed for. Any other
+    stream leaves it in place, so a turn that never drained it cannot pass it
+    to a later turn; the leftover is replaced by the session's next voice turn
+    or evicted by the cap.
+    """
+    if not _INTERRUPT_NOTES and not _VOICE_MODE_NOTES:
+        return []
+    session_id = str(session_id or "").strip()
+    stream_id = str(stream_id or "").strip()
+    with _LOCK:
+        interrupted_at = _INTERRUPT_NOTES.pop(session_id, None)
+        voice_mode = _VOICE_MODE_NOTES.get(session_id)
+        if voice_mode is not None and voice_mode[0] == stream_id:
+            del _VOICE_MODE_NOTES[session_id]
+        else:
+            voice_mode = None
+    now = time.time()
+    notes = []
+    if interrupted_at is not None and now - interrupted_at <= _NOTE_TTL_SECONDS:
+        notes.append(INTERRUPT_NOTE)
+    if voice_mode is not None and now - voice_mode[1] <= _NOTE_TTL_SECONDS:
+        notes.append(VOICE_MODE_NOTE)
+    return notes
+
+
+def prepend_turn_notes(session_id, text: str, stream_id=None) -> str:
+    """Prefix ``text`` with the turn's armed notes, consuming them."""
+    return "\n\n".join([*consume_turn_notes(session_id, stream_id), text])
 
 
 def reset_for_tests() -> None:
@@ -417,3 +496,4 @@ def reset_for_tests() -> None:
         _TURNS.clear()
         _AWAITING_REPLY.clear()
         _INTERRUPT_NOTES.clear()
+        _VOICE_MODE_NOTES.clear()

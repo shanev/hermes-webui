@@ -637,13 +637,13 @@ def test_interrupt_note_reaches_only_the_next_turn(monkeypatch, stop_path):
     _known_session(monkeypatch, active_stream_id=STREAM)
     _interrupt({"session_id": SID})
 
-    first = voice.prepend_interrupt_note(SID, "and tomorrow?")
-    second = voice.prepend_interrupt_note(SID, "thanks")
+    first = voice.prepend_turn_notes(SID, "and tomorrow?", "next-stream")
+    second = voice.prepend_turn_notes(SID, "thanks", "later-stream")
 
     assert "the previous spoken reply was interrupted" in first
     assert first == f"{voice.INTERRUPT_NOTE}\n\nand tomorrow?"
     assert second == "thanks"
-    assert voice.prepend_interrupt_note(OTHER_SID, "hello") == "hello"
+    assert voice.prepend_turn_notes(OTHER_SID, "hello", "other-stream") == "hello"
 
 
 def test_interrupt_note_expires(monkeypatch):
@@ -656,11 +656,12 @@ def test_interrupt_note_expires(monkeypatch):
 
 def test_local_turn_injects_the_note_through_the_notification_prefix():
     src = (REPO / "api" / "streaming.py").read_text(encoding="utf-8")
-    start = src.index("_voice_interrupt_note = _voice.consume_interrupt_note(session_id)")
+    # The turn's notes are drained once, for this stream, ahead of the
+    # process notifications...
+    start = src.index("_process_notifications[:0] = _voice.consume_turn_notes(session_id, stream_id)")
     window = src[start:src.index("_run_conversation_kwargs = _build_run_conversation_kwargs(", start)]
 
-    # Same model-only prefix as process notifications...
-    assert "_process_notifications.insert(0, _voice_interrupt_note)" in window
+    # ...and share their model-only prefix...
     assert '_agent_msg_text = "\\n\\n".join([*_process_notifications, msg_text]).strip()' in window
     # ...while the persisted user message stays the clean text.
     tail = src[start:src.index("result = agent.run_conversation(**_run_conversation_kwargs)", start)]
@@ -670,6 +671,195 @@ def test_local_turn_injects_the_note_through_the_notification_prefix():
 def test_gateway_turns_prepend_the_note_to_the_request_only():
     src = (REPO / "api" / "gateway_chat.py").read_text(encoding="utf-8")
 
-    assert src.count("_voice.prepend_interrupt_note(session_id, str(msg_text or \"\"))") == 2
+    assert src.count("_voice.prepend_turn_notes(session_id, str(msg_text or \"\"), stream_id)") == 2
     # Transcript writeback keeps using the clean msg_text.
     assert "active_turn_identity = _active_turn_authority(s, stream_id, msg_text)" in src
+
+
+# ── voice-mode directive ────────────────────────────────────────────────────
+
+
+VOICE_SID = "voicemodesession1"
+
+
+def test_voice_mode_directive_reaches_only_the_turn_it_was_armed_for():
+    voice.arm_voice_mode_note(SID, STREAM)
+
+    first = voice.prepend_turn_notes(SID, "what is the weather", STREAM)
+    second = voice.prepend_turn_notes(SID, "thanks", "text-stream")
+
+    assert first == f"{voice.VOICE_MODE_NOTE}\n\nwhat is the weather"
+    assert "This reply will be spoken aloud." in first
+    assert "no markdown formatting, no code blocks, no tables, no URLs" in first
+    assert second == "thanks"
+
+
+def test_text_turns_carry_no_directive():
+    assert voice.consume_turn_notes(SID, STREAM) == []
+    assert voice.prepend_turn_notes(SID, "hello", STREAM) == "hello"
+
+    # Another session's voice turn changes nothing here.
+    voice.arm_voice_mode_note(OTHER_SID, "other-stream")
+    assert voice.prepend_turn_notes(SID, "hello", STREAM) == "hello"
+    assert voice.consume_turn_notes(OTHER_SID, "other-stream") == [voice.VOICE_MODE_NOTE]
+
+
+@pytest.mark.parametrize("interrupt_first", [True, False])
+def test_interrupt_note_and_directive_both_reach_the_same_turn(interrupt_first):
+    if interrupt_first:
+        voice.arm_interrupt_note(SID)
+        voice.arm_voice_mode_note(SID, STREAM)
+    else:
+        voice.arm_voice_mode_note(SID, STREAM)
+        voice.arm_interrupt_note(SID)
+
+    first = voice.prepend_turn_notes(SID, "and tomorrow?", STREAM)
+    second = voice.prepend_turn_notes(SID, "thanks", STREAM)
+
+    # Neither arm clobbers the other; the note about the previous reply leads.
+    assert first == f"{voice.INTERRUPT_NOTE}\n\n{voice.VOICE_MODE_NOTE}\n\nand tomorrow?"
+    assert second == "thanks"
+
+
+def test_directive_left_by_a_turn_that_never_ran_is_not_inherited():
+    # The voice turn's worker never drained its notes (failed launch, early crash).
+    voice.arm_voice_mode_note(SID, "dead-stream")
+    voice.arm_interrupt_note(SID)
+
+    # The next turn is typed: it still learns about the barge-in, nothing else.
+    assert voice.consume_turn_notes(SID, STREAM) == [voice.INTERRUPT_NOTE]
+    assert voice.consume_turn_notes(SID, STREAM) == []
+
+    # The session's next voice turn replaces the leftover.
+    voice.arm_voice_mode_note(SID, STREAM)
+    assert voice.consume_turn_notes(SID, "dead-stream") == []
+    assert voice.consume_turn_notes(SID, STREAM) == [voice.VOICE_MODE_NOTE]
+
+
+def test_voice_mode_directive_expires(monkeypatch):
+    voice.arm_voice_mode_note(SID, STREAM)
+    monkeypatch.setattr(voice, "_NOTE_TTL_SECONDS", -1.0)
+
+    assert voice.consume_turn_notes(SID, STREAM) == []
+    assert voice._VOICE_MODE_NOTES == {}
+
+
+def test_arming_needs_a_session_and_a_stream():
+    voice.arm_voice_mode_note("", STREAM)
+    voice.arm_voice_mode_note(SID, None)
+
+    assert voice._VOICE_MODE_NOTES == {}
+
+
+def _start_turn(monkeypatch, tmp_path, **start_kwargs):
+    """Start a chat turn; return what its worker would send the model."""
+    from api.models import Session
+
+    delivered = []
+
+    def fake_worker(*_args, **_kwargs):
+        return None
+
+    class WorkerThread:
+        def __init__(self, *_args, target=None, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            if self.target is not fake_worker:
+                return
+            # Where the real workers drain the turn's notes: at turn start,
+            # for their own session and stream.
+            session_id, msg, _model, _workspace, stream_id, _attachments = self.args
+            delivered.append(voice.prepend_turn_notes(session_id, msg, stream_id))
+
+    monkeypatch.setattr(Session, "save", lambda self, *a, **k: None)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda workspace, **_kw: None)
+    monkeypatch.setattr(routes, "create_stream_channel", lambda: object())
+    monkeypatch.setattr(routes, "_run_agent_streaming", fake_worker)
+    monkeypatch.setattr(routes.threading, "Thread", WorkerThread)
+
+    response = routes._start_chat_stream_for_session(
+        Session(session_id=VOICE_SID, title="Untitled"),
+        msg="what is the weather",
+        attachments=[],
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider=None,
+        external_runtime_owned=False,
+        **start_kwargs,
+    )
+    stream_id = response["stream_id"]
+    with config.STREAMS_LOCK:
+        config.STREAMS.pop(stream_id, None)
+    config.unregister_stream_owner(stream_id)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.pop(stream_id, None)
+    return delivered
+
+
+def test_voice_turn_start_delivers_the_directive_to_its_worker(monkeypatch, tmp_path):
+    delivered = _start_turn(monkeypatch, tmp_path, voice_mode=True)
+
+    assert delivered == [f"{voice.VOICE_MODE_NOTE}\n\nwhat is the weather"]
+    assert voice._VOICE_MODE_NOTES == {}
+
+
+def test_text_turn_start_delivers_the_bare_message(monkeypatch, tmp_path):
+    delivered = _start_turn(monkeypatch, tmp_path)
+
+    assert delivered == ["what is the weather"]
+    assert voice._VOICE_MODE_NOTES == {}
+
+
+def test_voice_turn_after_a_barge_in_delivers_both_notes(monkeypatch, tmp_path):
+    voice.arm_interrupt_note(VOICE_SID)
+
+    delivered = _start_turn(monkeypatch, tmp_path, voice_mode=True)
+
+    assert delivered == [
+        f"{voice.INTERRUPT_NOTE}\n\n{voice.VOICE_MODE_NOTE}\n\nwhat is the weather"
+    ]
+    assert voice.consume_interrupt_note(VOICE_SID) is None
+
+
+@pytest.mark.parametrize("voice_mode, expected", [(True, {"voice_mode": True}), (False, {})])
+def test_start_run_passes_voice_mode_only_for_voice_turns(monkeypatch, voice_mode, expected):
+    seen = {}
+
+    def fake_start(_session, **kwargs):
+        seen.update(kwargs)
+        return {"stream_id": STREAM}
+
+    monkeypatch.setattr(routes, "_start_chat_stream_for_session", fake_start)
+
+    routes._start_run(
+        SimpleNamespace(session_id=VOICE_SID),
+        msg="what is the weather",
+        attachments=[],
+        workspace="/tmp",
+        model="test-model",
+        model_provider=None,
+        normalized_model=False,
+        source="webui",
+        route="/api/chat/start",
+        voice_mode=voice_mode,
+    )
+
+    assert {key: value for key, value in seen.items() if key == "voice_mode"} == expected
+
+
+def test_chat_start_requests_voice_mode_only_for_a_voice_turn_id():
+    src = (REPO / "api" / "routes.py").read_text(encoding="utf-8")
+    start = src.index("def _handle_chat_start(handler, body, diag=None):")
+    body = src[start:src.index("def _resolve_chat_workspace_with_recovery", start)]
+
+    # Only a well-formed voice turn id opts in, and never for a regeneration.
+    assert (
+        'if regeneration is None and _voice.is_turn_id(body.get("voice_turn_id")):\n'
+        '            start_run_kwargs["voice_mode"] = True'
+    ) in body
+    assert body.index('start_run_kwargs["voice_mode"] = True') < body.index("response = _start_run(")
+    assert voice.is_turn_id("vt_" + "a" * 32) is True
+    assert voice.is_turn_id("") is False
+    assert voice.is_turn_id(None) is False

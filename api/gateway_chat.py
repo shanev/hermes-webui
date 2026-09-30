@@ -641,9 +641,10 @@ def _run_gateway_runs_api_streaming(
     try:
         url_runs = f"{base_url.rstrip('/')}/v1/runs"
         headers = _gateway_run_headers(session_id, api_key)
-        # Barge-in note (POST /api/voice/interrupt) goes to the Gateway request
-        # only; the WebUI transcript is rebuilt from the clean msg_text.
-        msg_text = _voice.prepend_interrupt_note(session_id, str(msg_text or ""))
+        # Voice turn notes (barge-in note, spoken-output directive) go to the
+        # Gateway request only; the WebUI transcript is rebuilt from the clean
+        # msg_text.
+        msg_text = _voice.prepend_turn_notes(session_id, str(msg_text or ""), stream_id)
         message_content: Any = str(msg_text or "")
         if attachments:
             try:
@@ -1392,9 +1393,10 @@ def _run_gateway_chat_streaming(
                 # Scope Gateway long-term continuity to this WebUI conversation
                 # without exposing the browser's auth cookie or CSRF material.
                 headers["X-Hermes-Session-Key"] = f"webui:{session_id}"
-            # Barge-in note (POST /api/voice/interrupt) goes to the Gateway
-            # request only; msg_text stays clean for the transcript writeback.
-            gateway_msg_text = _voice.prepend_interrupt_note(session_id, str(msg_text or ""))
+            # Voice turn notes (barge-in note, spoken-output directive) go to
+            # the Gateway request only; msg_text stays clean for the transcript
+            # writeback.
+            gateway_msg_text = _voice.prepend_turn_notes(session_id, str(msg_text or ""), stream_id)
             message_content: Any = gateway_msg_text
             if attachments:
                 try:
