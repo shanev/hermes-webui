@@ -664,6 +664,40 @@ def _stream_id_owner_session_id(stream_id: str | None) -> str | None:
     return None
 
 
+def _gateway_stop_blocked_for_stream(stream_id: str) -> bool:
+    """Stop the Gateway run behind ``stream_id``; True means Stop must not proceed.
+
+    Shared first step of every Stop entry point (``/api/chat/cancel`` and
+    ``/api/voice/interrupt``): a Gateway-owned run resolves to the Gateway
+    outcome before the local cancel path runs. A stream with no Gateway run is
+    a no-op here (returns False).
+    """
+    try:
+        from api.gateway_chat import (
+            GATEWAY_RUN_ID_WAIT_TIMEOUT,
+            stop_gateway_run,
+            wait_for_gateway_run_id,
+        )
+
+        structured_gateway, run_id = wait_for_gateway_run_id(stream_id, GATEWAY_RUN_ID_WAIT_TIMEOUT)
+        if not run_id and structured_gateway:
+            return True
+        if run_id:
+            if not stop_gateway_run(run_id):
+                return True
+            owner_sid = stream_owner_session_id(stream_id)
+            if owner_sid:
+                settle_gateway_pending_run(
+                    owner_sid,
+                    run_id,
+                    reason="Gateway run was cancelled before approval resolution",
+                )
+    except Exception:
+        logger.debug("Failed to stop gateway run during chat cancellation", exc_info=True)
+        return True
+    return False
+
+
 def _stream_id_visible_to_request_profile(
     handler,
     stream_id: str | None,
@@ -6693,6 +6727,191 @@ def _handle_client_event_log(handler, body: dict) -> bool:
     return j(handler, {"ok": True, "event": payload.get("event")}) or True
 
 
+def _read_voice_metrics_payload(handler) -> tuple:
+    """Read a POST /api/voice/metrics body under its endpoint-specific cap.
+
+    Returns ``(payload, status, error)``; ``error`` is None when a JSON value
+    was read.
+    """
+    try:
+        length = _safe_content_length(handler, _voice.MAX_METRIC_BODY_BYTES)
+    except OverflowError:
+        try:
+            handler.rfile.read(_voice.MAX_METRIC_BODY_BYTES)
+        except Exception:
+            pass
+        return None, 413, "request body too large"
+    except ValueError:
+        return None, 400, "invalid Content-Length"
+    raw = handler.rfile.read(length) if length else b""
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, 400, "invalid JSON body"
+    return payload, 200, None
+
+
+def _handle_voice_metrics(handler, payload, status: int = 200, error: str | None = None) -> bool:
+    """Record one client-observed voice stage (e.g. ``playback_start``).
+
+    Accepts ``{session_id, turn_id, stage, ts}`` only; the body is never logged
+    and unknown turns create no state.
+    """
+    if error:
+        return bad(handler, error, status) or True
+    event, invalid = _voice.validate_metric_event(payload)
+    if invalid:
+        return bad(handler, invalid, 400) or True
+    if not is_safe_session_id(event["session_id"]):
+        return bad(handler, "invalid session_id", 400) or True
+    if not _session_id_visible_to_request_profile(handler, event["session_id"]):
+        return True
+    outcome = _voice.record_client_stage(**event)
+    if outcome == "unknown_turn":
+        return bad(handler, "unknown turn_id", 404) or True
+    return j(
+        handler,
+        {
+            "ok": True,
+            "recorded": outcome == "recorded",
+            "turn_id": event["turn_id"],
+            "stage": event["stage"],
+        },
+    ) or True
+
+
+def _voice_streamed_chars(stream_id: str) -> int:
+    """Length of the reply text already streamed for ``stream_id`` (0 if gone)."""
+    from api import config as _live_config
+
+    with STREAMS_LOCK:
+        return len(str(_live_config.STREAM_PARTIAL_TEXT.get(stream_id) or ""))
+
+
+def _voice_interrupt_target(
+    session_id: str,
+    session_stream_id: str | None,
+    turn_stream_id: str | None,
+) -> str | None:
+    """Return the live, not-yet-cancelled stream a barge-in may stop, if any.
+
+    Read-only, on the Stop lock edge (STREAMS_LOCK -> ACTIVE_RUNS_LOCK). Fails
+    closed: a stream is eligible only when the active-run registry, or for a
+    just-started stream the pre-worker owner registry, says it belongs to
+    ``session_id``. A turn-bound stream is the only candidate when the caller
+    names a bound turn, so a barge-in aimed at a finished reply never stops the
+    session's newer run.
+    """
+    from api import config as _live_config
+
+    with STREAMS_LOCK:
+        live_streams = set(STREAMS.keys())
+        with _live_config.ACTIVE_RUNS_LOCK:
+            runs = {
+                str(raw.get("stream_id") or key): dict(raw)
+                for key, raw in (_live_config.ACTIVE_RUNS or {}).items()
+                if isinstance(raw, dict)
+            }
+    if turn_stream_id:
+        candidates = [turn_stream_id]
+    else:
+        candidates = [session_stream_id] + [
+            stream_id
+            for stream_id, run in runs.items()
+            if str(run.get("session_id") or "").strip() == session_id
+        ]
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            continue
+        run = runs.get(candidate)
+        if run is not None:
+            if (
+                str(run.get("session_id") or "").strip() == session_id
+                and str(run.get("phase") or "").strip() != "cancelling"
+            ):
+                return candidate
+            continue
+        if candidate in live_streams and stream_owner_session_id(candidate) == session_id:
+            return candidate
+    return None
+
+
+def _handle_voice_interrupt(handler, body) -> bool:
+    """Barge-in: stop the session's active reply through the existing Stop path.
+
+    Cancellation is delegated unchanged to the ``/api/chat/cancel`` machinery
+    (Gateway stop first, then ``cancel_stream`` / the runtime adapter), which
+    persists the partial assistant message as-is. This handler only picks the
+    stream, reports how many reply characters had streamed, and arms the
+    one-shot note for the session's next user turn. No registry lock is held
+    across the cancel call or the response write.
+    """
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        return bad(handler, "session_id required")
+    if not is_safe_session_id(session_id):
+        return bad(handler, "invalid session_id")
+    turn_id = body.get("turn_id")
+    if turn_id in (None, ""):
+        turn_id = None
+    elif not _voice.is_turn_id(turn_id):
+        return bad(handler, "invalid turn_id")
+    try:
+        session = get_session(session_id, metadata_only=True)
+    except Exception:
+        session = None
+    if session is None:
+        # No such session: nothing to stop and no next turn to annotate.
+        return j(handler, {"ok": True, "cancelled": False, "truncated_chars": 0})
+    turn_stream_id = None
+    if turn_id:
+        turn_status, turn_stream_id = _voice.stream_for_turn(turn_id, session_id)
+        if turn_status == "mismatch":
+            return bad(handler, "turn_id does not belong to session", 409)
+    stream_id = _voice_interrupt_target(
+        session_id,
+        getattr(session, "active_stream_id", None),
+        turn_stream_id,
+    )
+    cancelled = False
+    truncated_chars = 0
+    if stream_id:
+        # Snapshot before the Gateway stop as well: a stopped Gateway worker can
+        # tear its buffers down before the local cancel path runs.
+        truncated_chars = _voice_streamed_chars(stream_id)
+        if _gateway_stop_blocked_for_stream(stream_id):
+            return j(
+                handler,
+                {
+                    "ok": False,
+                    "cancelled": False,
+                    "truncated_chars": 0,
+                    "error": "Gateway stop failed",
+                },
+                status=502,
+            )
+        truncated_chars = max(truncated_chars, _voice_streamed_chars(stream_id))
+        from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
+
+        if runtime_adapter_enabled():
+            adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_stream)
+            cancelled = bool(adapter.cancel_run(stream_id).accepted)
+        else:
+            cancelled = bool(cancel_stream(stream_id))
+        if not cancelled:
+            truncated_chars = 0
+    _voice.arm_interrupt_note(session_id)
+    _voice.record_interrupt(
+        session_id,
+        turn_id,
+        truncated_chars=truncated_chars,
+        cancelled=cancelled,
+        stream_id=stream_id,
+    )
+    return j(handler, {"ok": True, "cancelled": cancelled, "truncated_chars": truncated_chars})
+
+
 def _starts_token(raw: str, prefix: str) -> bool:
     if not raw.startswith(prefix):
         return False
@@ -11063,6 +11282,7 @@ from api.streaming import (
     _CompactEchoIndex,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
+from api import voice as _voice
 from api.run_journal import (
     runtime_model_from_events,
     _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
@@ -14903,32 +15123,7 @@ def handle_get(handler, parsed) -> bool:
             return bad(handler, "stream_id required")
         if not _stream_id_visible_to_request_profile(handler, stream_id):
             return True
-        gateway_stop_blocked = False
-        try:
-            from api.gateway_chat import (
-                GATEWAY_RUN_ID_WAIT_TIMEOUT,
-                stop_gateway_run,
-                wait_for_gateway_run_id,
-            )
-
-            structured_gateway, run_id = wait_for_gateway_run_id(stream_id, GATEWAY_RUN_ID_WAIT_TIMEOUT)
-            if not run_id and structured_gateway:
-                gateway_stop_blocked = True
-            if run_id:
-                if stop_gateway_run(run_id):
-                    owner_sid = stream_owner_session_id(stream_id)
-                    if owner_sid:
-                        settle_gateway_pending_run(
-                            owner_sid,
-                            run_id,
-                            reason="Gateway run was cancelled before approval resolution",
-                        )
-                else:
-                    gateway_stop_blocked = True
-        except Exception:
-            logger.debug("Failed to stop gateway run during chat cancellation", exc_info=True)
-            gateway_stop_blocked = True
-        if gateway_stop_blocked:
+        if _gateway_stop_blocked_for_stream(stream_id):
             return j(
                 handler,
                 {
@@ -15656,6 +15851,11 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.stage("read_client_event_body")
         return _handle_client_event_log(handler, _read_client_event_payload(handler))
+
+    if parsed.path == "/api/voice/metrics":
+        if diag:
+            diag.stage("read_voice_metrics_body")
+        return _handle_voice_metrics(handler, *_read_voice_metrics_payload(handler))
 
     if diag:
         diag.stage("read_body")
@@ -17082,6 +17282,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/chat/steer":
         from api.streaming import _handle_chat_steer
         return _handle_chat_steer(handler, body)
+
+    if parsed.path == "/api/voice/interrupt":
+        return _handle_voice_interrupt(handler, body)
 
     if parsed.path == "/api/terminal/start":
         return _handle_terminal_start(handler, body)
@@ -20518,6 +20721,7 @@ def _handle_tts(handler, parsed):
     async API at that time.
     """
     text = ""
+    voice_turn_id = None  # optional voice-turn correlation id (api/voice.py)
     voice = "zh-CN-XiaoxiaoNeural"
     rate_str = ""
     pitch_str = ""
@@ -20530,6 +20734,7 @@ def _handle_tts(handler, parsed):
     try:
         data = read_body(handler)
         text = (data.get("text") or "").strip()
+        voice_turn_id = data.get("turn_id")
         voice = data.get("voice") or voice
         rate_str = _normalize_tts_prosody(data.get("rate"), unit="%")
         pitch_str = _normalize_tts_prosody(data.get("pitch"), unit="Hz")
@@ -20689,6 +20894,7 @@ def _handle_tts(handler, parsed):
             from api.helpers import bad as _bad
             return _bad(handler, "ElevenLabs TTS generation failed", 500)
 
+        _voice.mark_stage(voice_turn_id, "tts_first_byte")
         handler.send_response(200)
         handler.send_header("Content-Type", "audio/mpeg")
         handler.send_header("Cache-Control", "no-store")
@@ -20772,6 +20978,7 @@ def _handle_tts(handler, parsed):
             from api.helpers import bad as _bad
             return _bad(handler, "OpenAI TTS generation failed", 500)
 
+        _voice.mark_stage(voice_turn_id, "tts_first_byte")
         handler.send_response(200)
         handler.send_header("Content-Type", "audio/mpeg")
         handler.send_header("Cache-Control", "no-store")
@@ -20824,6 +21031,7 @@ def _handle_tts(handler, parsed):
             from api.helpers import bad as _bad
             return _bad(handler, "TTS produced no audio", 500)
 
+        _voice.mark_stage(voice_turn_id, "tts_first_byte")
         handler.send_response(200)
         handler.send_header("Content-Type", "audio/mpeg")
         handler.send_header("Content-Length", str(len(audio_buf)))
@@ -25214,6 +25422,11 @@ def _handle_chat_start(handler, body, diag=None):
             restore_err = _restore_cleared_recovery()
             if restore_err is not None:
                 return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
+        # Voice stage timing: attach the accepted stream to the client's voice
+        # turn (the turn_id returned by /api/transcribe). Instrumentation only;
+        # an unknown or foreign turn is ignored.
+        if status == 200 and body.get("voice_turn_id") and response.get("stream_id"):
+            _voice.bind_stream(body.get("voice_turn_id"), s.session_id, response["stream_id"])
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:

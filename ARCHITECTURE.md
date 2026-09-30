@@ -70,6 +70,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
+      voice.py             Voice-turn stage timing log + barge-in interrupt note (in-memory)
       workspace.py         File ops: list_dir, read_file_content, git detection, workspace helpers
     static/
       index.html           HTML template
@@ -1531,6 +1532,35 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
     /api/share/revoke          {"session_id"} -> revokes the current public snapshot link
     /api/approval/respond      {"session_id", "choice": once|session|always|deny}
                                -> {"ok": true, "choice": choice}
+
+### Voice client endpoints (stage timing + barge-in)
+
+State lives in `api/voice.py`: process-local, bounded, never persisted, and never
+authoritative for run state. One `[webui] {"event":"voice_turn",...}` line is
+written to the service log per turn (ids, stage timestamps in epoch ms, elapsed
+ms, character counts — never message content) when `playback_start` arrives, on
+barge-in, or once the turn is 120 s old.
+
+    /api/transcribe            multipart/form-data. Fields: file, session_id? (correlation
+                               label). -> {"ok", "transcript", "turn_id"}. turn_id opens the
+                               voice turn (stages transcribe_start, transcribe_done).
+    /api/chat/start            Optional "voice_turn_id": binds the accepted stream to the turn
+                               (stages first_token, first_sentence from the reply stream).
+    /api/tts                   Optional "turn_id": stamps tts_first_byte when the first
+                               sentence's audio is ready to send.
+    /api/voice/metrics         {"session_id", "turn_id", "stage", "ts"} -> {"ok", "recorded",
+                               "turn_id", "stage"}. Client-observed stages (playback_start).
+                               stage must be one of the six stage names; ts is epoch ms;
+                               body capped at 2 KB (413). Unknown turn -> 404.
+    /api/voice/interrupt       {"session_id", "turn_id"?} -> {"ok": true, "cancelled",
+                               "truncated_chars"}. Stops the session's active reply through
+                               the same Stop path as /api/chat/cancel (Gateway stop, then
+                               cancel_stream / runtime adapter); the partial assistant
+                               message is persisted as-is. truncated_chars is the reply text
+                               already streamed (0 when nothing was running). A turn bound
+                               to a finished stream never stops the session's newer run.
+                               The session's next user turn carries a one-shot, model-only
+                               note that the previous spoken reply was interrupted.
 
 ### GET Endpoints Added in Sprint 3
 

@@ -14,7 +14,8 @@ from api.helpers import (
     unreadable_content_length,
     unsupported_transfer_encoding,
 )
-from api.models import get_session
+from api import voice as _voice
+from api.models import get_session, is_safe_session_id
 from api.profiles import _profiles_match, get_active_profile_name as _get_active_profile_name
 from api.workspace import (
     safe_resolve_ws,
@@ -513,6 +514,8 @@ def handle_upload_extract(handler):
 def handle_transcribe(handler):
     import traceback as _tb
     temp_path = None
+    # Voice stage timing: the turn starts when the audio request reaches the handler.
+    transcribe_start_ms = _voice.now_ms()
     try:
         try:
             fields, files = _read_multipart_or_reject(handler)
@@ -538,7 +541,15 @@ def handle_transcribe(handler):
             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
             return j(handler, {'error': msg}, status=status)
         transcript = str(result.get('transcript') or '').strip()
-        return j(handler, {'ok': True, 'transcript': transcript})
+        # turn_id lets the voice client correlate this transcription with the
+        # chat stream, TTS and its own playback metrics (see api/voice.py).
+        # The optional session_id field is a correlation label only.
+        session_id = fields.get('session_id', '')
+        turn_id = _voice.begin_turn(
+            session_id if is_safe_session_id(session_id) and len(session_id) <= 128 else None,
+            transcribe_start_ms=transcribe_start_ms,
+        )
+        return j(handler, {'ok': True, 'transcript': transcript, 'turn_id': turn_id})
     except ValueError as e:
         return j(handler, {'error': str(e)}, status=400)
     except Exception:

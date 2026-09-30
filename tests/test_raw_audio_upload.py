@@ -93,7 +93,10 @@ def test_raw_audio_vs_transcribe_no_regression(monkeypatch):
     handle_transcribe(handler)
 
     assert handler.status == 200
-    assert handler.payload() == {"ok": True, "transcript": "hello from audio"}
+    payload = handler.payload()
+    # turn_id is the voice-turn correlation id added in voice Phase 1.
+    assert str(payload.pop("turn_id")).startswith("vt_")
+    assert payload == {"ok": True, "transcript": "hello from audio"}
 
 
 def test_raw_audio_upload_requires_session():

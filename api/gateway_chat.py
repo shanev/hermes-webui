@@ -35,6 +35,7 @@ from api.config import (
     unregister_stream_owner,
     update_active_run,
 )
+from api import voice as _voice
 from api.helpers import _redact_text, redact_session_data
 from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
 from api.run_journal import RunJournalWriter, bound_run_journal_snapshot_args
@@ -640,6 +641,9 @@ def _run_gateway_runs_api_streaming(
     try:
         url_runs = f"{base_url.rstrip('/')}/v1/runs"
         headers = _gateway_run_headers(session_id, api_key)
+        # Barge-in note (POST /api/voice/interrupt) goes to the Gateway request
+        # only; the WebUI transcript is rebuilt from the clean msg_text.
+        msg_text = _voice.prepend_interrupt_note(session_id, str(msg_text or ""))
         message_content: Any = str(msg_text or "")
         if attachments:
             try:
@@ -1210,6 +1214,10 @@ def _run_gateway_chat_streaming(
         if event == "apperror" and isinstance(data, dict):
             data = data.copy()
             data.setdefault("session_id", session_id)
+        if event == "token" and isinstance(data, dict):
+            # Voice stage timing (first_token / first_sentence); a single dict
+            # miss for streams that are not an open voice turn.
+            _voice.note_reply_text(stream_id, data.get("text"))
         event_id = None
         if run_journal is not None:
             try:
@@ -1384,15 +1392,18 @@ def _run_gateway_chat_streaming(
                 # Scope Gateway long-term continuity to this WebUI conversation
                 # without exposing the browser's auth cookie or CSRF material.
                 headers["X-Hermes-Session-Key"] = f"webui:{session_id}"
-            message_content: Any = str(msg_text or "")
+            # Barge-in note (POST /api/voice/interrupt) goes to the Gateway
+            # request only; msg_text stays clean for the transcript writeback.
+            gateway_msg_text = _voice.prepend_interrupt_note(session_id, str(msg_text or ""))
+            message_content: Any = gateway_msg_text
             if attachments:
                 try:
                     from api.streaming import _build_native_multimodal_message
 
-                    message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""), profile=getattr(s, "profile", None))
+                    message_content = _build_native_multimodal_message("", gateway_msg_text, attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""), profile=getattr(s, "profile", None))
                 except Exception:
                     logger.debug("Failed to build gateway multimodal attachment payload", exc_info=True)
-                    message_content = str(msg_text or "")
+                    message_content = gateway_msg_text
             body = {
                 "model": _gateway_model_field(model) or "default",
                 "stream": True,
@@ -1779,6 +1790,8 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)
+        # Close voice stage timing for this stream before taking registry locks.
+        _voice.note_reply_end(stream_id)
         with STREAMS_LOCK:
             AGENT_INSTANCES.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

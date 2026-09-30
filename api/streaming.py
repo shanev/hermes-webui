@@ -75,6 +75,7 @@ from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
+from api import voice as _voice
 from api.models import (
     StateDBSessionMessagesSnapshot,
     _WEBUI_TRUSTED_AGENT_INPUT_FIELD,
@@ -10845,6 +10846,9 @@ def _run_agent_streaming(
                 if stream_id in STREAM_PARTIAL_TEXT:
                     STREAM_PARTIAL_TEXT[stream_id] += str(text)
                 put('token', {'text': text})
+                # Voice stage timing (first_token / first_sentence); a single
+                # dict miss for streams that are not an open voice turn.
+                _voice.note_reply_text(stream_id, text)
                 # Update live throughput from stream delta callbacks, not from
                 # byte/character length. If a backend cannot provide live deltas,
                 # the frontend hides TPS rather than showing an estimate.
@@ -11951,6 +11955,12 @@ def _run_agent_streaming(
                 session_id,
                 pending_async_acceptances=_pending_async_acceptances,
             )
+            # Barge-in: a one-shot note armed by POST /api/voice/interrupt rides
+            # the same model-only prefix as process notifications, so the
+            # persisted/displayed user message stays the clean msg_text.
+            _voice_interrupt_note = _voice.consume_interrupt_note(session_id)
+            if _voice_interrupt_note:
+                _process_notifications.insert(0, _voice_interrupt_note)
             _agent_msg_text = msg_text
             if _process_notifications:
                 _agent_msg_text = "\n\n".join([*_process_notifications, msg_text]).strip()
@@ -14257,6 +14267,8 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
+        # Close voice stage timing for this stream before taking registry locks.
+        _voice.note_reply_end(stream_id)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

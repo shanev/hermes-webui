@@ -81,7 +81,11 @@ def test_handle_transcribe_returns_transcript(monkeypatch):
     handle_transcribe(handler)
 
     assert handler.status == 200
-    assert handler.payload() == {"ok": True, "transcript": "hello from audio"}
+    payload = handler.payload()
+    # turn_id is the voice-turn correlation id added in voice Phase 1.
+    turn_id = payload.pop("turn_id")
+    assert upload._voice.is_turn_id(turn_id)
+    assert payload == {"ok": True, "transcript": "hello from audio"}
 
 
 def test_handle_transcribe_surfaces_provider_error(monkeypatch):
