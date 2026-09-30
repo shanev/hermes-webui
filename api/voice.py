@@ -1,7 +1,8 @@
 """Voice-turn stage timing and barge-in bookkeeping (voice Phase 1).
 
 A voice client (Hark) drives one reply turn through ``/api/transcribe``,
-``/api/chat/start`` + the token stream, and per-sentence ``/api/tts``. This
+``/api/chat/start`` + the token stream, and reply ``/api/tts/stream`` (or
+legacy per-sentence ``/api/tts``). This
 module correlates those requests under one ``turn_id`` and emits one structured
 ``voice_turn`` log line per turn so stage latency can be read from the service
 log.
@@ -13,8 +14,9 @@ open turns and armed turn notes (the barge-in note and the voice-mode
 directive); both degrade to "no instrumentation" and a chat-formatted reply.
 
 Privacy: records carry ids, stage names, timestamps and character counts only.
-Reply text passes through ``note_reply_text`` solely to find the first sentence
-boundary; at most a three-character tail is retained and it is never logged.
+Timing retains at most a three-character tail to find the first sentence
+boundary. The independent ``api.tts_stream`` tap retains bounded reply deltas
+for speech, including before audio attaches; neither module logs reply text.
 
 Locking: ``_LOCK`` is a leaf lock. No other lock is taken and no I/O happens
 while it is held (log lines are built under it and written after release), so
@@ -250,9 +252,15 @@ def _first_sentence_complete(rec: dict, text: str) -> bool:
 def note_reply_text(stream_id, text) -> None:
     """Per-token hook from the streaming workers. Never raises.
 
-    One lock-free dict miss for every stream that is not an open voice turn,
-    and for voice turns once their first sentence has been seen.
+    The bounded audio tap receives all reply deltas independently of SSE.
+    Timing retains one lock-free miss once the first sentence was recorded.
+    Audio tap failure must never terminate the underlying agent turn.
     """
+    try:
+        from api import tts_stream
+        tts_stream.note_text(stream_id, text)
+    except Exception:
+        pass
     turn_id = _AWAITING_REPLY.get(stream_id)
     if turn_id is None or not text:
         return
@@ -275,6 +283,11 @@ def note_reply_text(stream_id, text) -> None:
 
 def note_reply_end(stream_id) -> None:
     """Worker-teardown hook: a reply that ended mid-sentence is one sentence."""
+    try:
+        from api import tts_stream
+        tts_stream.note_end(stream_id)
+    except Exception:
+        pass
     turn_id = _AWAITING_REPLY.get(stream_id)
     if turn_id is None:
         return

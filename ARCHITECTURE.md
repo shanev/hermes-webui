@@ -1907,3 +1907,43 @@ an existing workspace. Strict: path must be under home, in the saved workspace l
 
 The distinction matters because add uses permissive validation to avoid the circular
 dependency: you cannot get a path into the saved list if you need the saved list to add it.
+
+### Reply audio streaming (voice Phase 2)
+
+`GET /api/tts/stream?stream_id=<accepted chat stream id>` uses the same cookie
+middleware and stream-owner profile visibility guard as chat SSE. Open it once per reply immediately after chat/start.
+It runs in a ThreadingHTTPServer request thread; a bounded producer queue
+allows the response thread to observe disconnects while relay reads block.
+The existing POST `/api/tts` and its rate limiter are unchanged.
+
+Wire v1 is HTTP/1.1 `Transfer-Encoding: chunked`, `Content-Type: audio/pcm`,
+`X-Audio-Sample-Rate: 24000`, `X-Audio-Channels: 1`, and
+`X-Audio-Format: s16le`: headerless mono signed 16-bit little-endian PCM at
+24 kHz. Relay requests use `stream:true,response_format:pcm` and the existing
+OpenAI TTS configuration/key precedence. Configure a relay/model implementing
+this PCM format (the OpenAI PCM convention); arbitrary-rate PCM is unsupported.
+HTTP chunks carry no sentence framing and can split samples. Clients preserve
+an odd trailing byte. The zero HTTP chunk denotes success; provider errors
+close the connection without it. Proxies must disable response buffering.
+
+The process-local audio tap receives token deltas at the existing voice hooks
+for both local and Gateway agents. It retains tokens before the audio GET
+independently of the text SSE subscription, with at most 128 replies, 128,000
+characters per reply, and a 120-second lifetime. Overflow/expiry stops audio,
+never the agent. One audio consumer is admitted per reply; reopening returns
+409. Sentence boundaries reuse the first_sentence heuristic. Tiny first
+sentences (<60 characters) merge with the following longer sentence; a fixed
+2.5-second deadline releases held text even during continuous token arrivals.
+Long unpunctuated clauses split around 300 characters. Speech sanitization
+runs on each unit. Voice mode and transcript ownership remain in Phase 1.
+
+Disconnect sets only the audio cancellation event and shuts down the active
+relay response socket; LLM production and text SSE continue. Cancellation
+while waiting for upstream headers closes the registered connection as well.
+DNS, connection establishment and TLS setup remain bounded by urllib's
+30-second socket timeout. The audio thread emits `voice_turn_audio` with
+`tts_first_byte` in milliseconds from the audio GET, and stamps Phase 1's
+`tts_first_byte` stage. No keys, reply text, or provider exceptions are logged.
+Gemini still synthesizes a complete unit before delivering its single chunk;
+continuous PCM scheduling removes client clip gaps but cannot promise a
+1.5–2-second start or eliminate provider starvation with that fallback.

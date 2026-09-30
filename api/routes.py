@@ -15145,6 +15145,10 @@ def handle_get(handler, parsed) -> bool:
             cancelled = cancel_stream(stream_id)
         return j(handler, {"ok": True, "cancelled": cancelled, "stream_id": stream_id})
 
+    if parsed.path == "/api/tts/stream":
+        from api.tts_stream import handle
+        return handle(handler, parsed)
+
     if parsed.path == "/api/chat/stream":
         return _handle_sse_stream(handler, parsed)
 
