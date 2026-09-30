@@ -20613,7 +20613,7 @@ def _handle_tts(handler, parsed):
                     self._hits[key] = now
                     return True
 
-        _handle_tts._tts_limiter = _TtsRateLimiter(window_seconds=2.0)
+        _handle_tts._tts_limiter = _TtsRateLimiter(window_seconds=max(0.0, float(os.getenv("HERMES_WEBUI_TTS_RATE_WINDOW", "2.0") or "2.0")))
 
     limiter = _handle_tts._tts_limiter
     if not limiter.check(handler, cv):
@@ -20752,6 +20752,9 @@ def _handle_tts(handler, parsed):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "audio/mpeg",
+            # Cloudflare in front of OpenAI-compatible relays (incl. ModelRelay)
+            # bans the default Python-urllib UA (error 1010). Send a client UA.
+            "User-Agent": "HermesWebUI/1.0 (TTS proxy)",
         })
 
         # Use a pinned HTTPS opener so the resolved address is the one that gets
