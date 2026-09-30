@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import select
 import socket
 import threading
@@ -19,13 +20,17 @@ from urllib.parse import parse_qs
 from urllib.request import Request, ProxyHandler, HTTPHandler, HTTPSHandler, build_opener
 from http.client import HTTPConnection
 
-from api import voice
+from api import tts_sanitize, voice
 
 _LOCK = threading.Lock()
 _REPLIES = OrderedDict()
 _MAX_REPLIES = 128
 _MAX_TEXT = 128_000
 _TTL = 120
+# A fenced block is held whole so sanitize() sees it once; past this size it
+# is cut like prose (each piece then announces the code it drops).
+_MAX_FENCE_HOLD = 20_000
+_FENCE_RE = re.compile(r"[ \t>]*(`{3,}|~{3,})")
 
 
 class Reply:
@@ -82,6 +87,7 @@ class SentenceChunker:
         self.held = None
         self.first = True
         self.deadline = None
+        self.reopen = ""  # fence carried past a block too long to hold
 
     def _emit(self, part):
         if self.held is not None:
@@ -96,23 +102,57 @@ class SentenceChunker:
                 return []
         return [part]
 
+    def _fences(self):
+        if "```" not in self.pending and "~~~" not in self.pending:
+            return []
+        return tts_sanitize.fenced_spans(self.pending)
+
+    def _sentence_end(self, fences):
+        # A sentence end inside a fenced block (every newline of one) is not
+        # a cut: sanitize() must see the whole block to speak or announce it.
+        # A closed block ends in a backtick or tilde, never a sentence end, so
+        # a cut at a span's end is inside a block still streaming.
+        for match in voice._SENTENCE_END_RE.finditer(self.pending):
+            if not any(start < match.end() <= end for start, end in fences):
+                return match.end()
+        return 0
+
+    def _outside_fences(self, cut, fences):
+        """Move a forced cut off a fenced block: before it, else after it. A
+        block still streaming is held (it is dropped from speech anyway) up to
+        a bound, past which it is dispatched whole and reopened for the rest,
+        so no later piece reads code aloud as prose."""
+        for start, end in fences:
+            if start < cut <= end:
+                if start:
+                    return start
+                if end < len(self.pending):
+                    return end
+                if len(self.pending) < _MAX_FENCE_HOLD:
+                    return 0
+                self.reopen = _FENCE_RE.match(self.pending).group(1) + "\n"
+                return len(self.pending)
+        return cut
+
     def append(self, token):
         if self.deadline is None:
             self.deadline = self.clock() + 2.5
         self.pending += token
         out = []
         while True:
-            match = voice._SENTENCE_END_RE.search(self.pending)
+            fences = self._fences()
             # Bound each relay request and dispatch long clauses before a full
             # sentence arrives. Split at whitespace where possible.
-            cut = match.end() if match else 0
+            cut = self._sentence_end(fences)
             if len(self.pending) >= 300 and (not cut or cut > 300):
                 cut = self.pending.rfind(" ", 20, 301)
                 if cut < 20:
                     cut = 300
+                cut = self._outside_fences(cut, fences)
             if not cut:
                 break
             part, self.pending = self.pending[:cut].strip(), self.pending[cut:]
+            self.pending, self.reopen = self.reopen + self.pending, ""
             if part:
                 out.extend(self._emit(part))
             # Never reset a held first clause's deadline for incoming tokens.
@@ -128,7 +168,18 @@ class SentenceChunker:
         return [" ".join(parts)] if parts else []
 
     def due(self):
-        return self.flush() if self.deadline is not None and self.clock() >= self.deadline else []
+        if self.deadline is None or self.clock() < self.deadline:
+            return []
+        fences = self._fences()
+        if not fences or fences[-1][1] < len(self.pending):
+            return self.flush()
+        # A block may still be streaming: speak what precedes it, keep it.
+        start = fences[-1][0]
+        parts = [part for part in (self.held, self.pending[:start].strip()) if part]
+        self.held, self.pending, self.deadline = None, self.pending[start:], None
+        if parts:
+            self.first = False
+        return [" ".join(parts)] if parts else []
 
 
 def _relay_settings():
@@ -255,8 +306,7 @@ def handle(handler, parsed):
         return build_opener(ProxyHandler({}), routes._NoRedirectTtsHandler(), SecureHandler(), LocalHandler())
 
     def synthesize(text):
-        from api.tts_sanitize import sanitize
-        text = sanitize(text).spoken()
+        text = tts_sanitize.sanitize(text).spoken()
         if not text or rec.cancel.is_set():
             return
         req = Request(base + "/audio/speech", data=json.dumps({

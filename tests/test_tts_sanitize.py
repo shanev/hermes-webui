@@ -476,3 +476,21 @@ def test_path_like_code_span_multi_segment():
     result = sanitize("call the `api/tts/stream` endpoint")
     assert result.code_note == ""
     assert "api tts stream" in result.text
+
+
+def test_whole_reply_one_line_fence_is_spoken():
+    # "```api```" on one line: its content sits between the runs.
+    assert sanitize("```api```").spoken() == "api"
+    assert sanitize("~~~\napi\n~~~").spoken() == "api"
+
+
+def test_whole_reply_block_with_two_lines_is_announced_not_truncated():
+    # Speaking only the first line would silently drop the second.
+    assert sanitize("```\napi\nmodels\n```").spoken() == (
+        "There is a code block in the chat transcript.")
+
+
+def test_fenced_spans_cover_blocks_and_an_unclosed_tail():
+    text = "Hi.\n```\napi\n```\nBye. ```py\nx"
+    spans = tts_sanitize.fenced_spans(text)
+    assert [text[start:end] for start, end in spans] == ["```\napi\n```", "```py\nx"]

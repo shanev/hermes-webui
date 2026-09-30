@@ -74,6 +74,65 @@ def test_mocked_llm_stream_chunked_pcm_and_batch_unchanged(monkeypatch):
     assert routes._handle_tts is batch
 
 
+def spoken_inputs(monkeypatch, tokens):
+    """Drive a voice reply through the real tap -> chunker -> sanitize -> relay
+    path and return the text each relay request was asked to speak."""
+    requests = []
+    def open_audio(req, **kwargs):
+        requests.append(json.loads(req.data)['input'])
+        return PCM(b'\x00' * 64)
+    monkeypatch.setattr(routes, '_tts_open', open_audio)
+    for token in tokens:
+        voice.note_reply_text('s', token)
+    voice.note_reply_end('s')
+    h = Handler()
+    assert tts.handle(h, urlsplit('/api/tts/stream?stream_id=s'))
+    assert h.status == 200
+    return requests
+
+
+@pytest.mark.parametrize('tokens, spoken', [
+    (['`api`'], ['api']),
+    (['```api```'], ['api']),
+    (['It is `/api/models`.'], ['It is api models.']),
+    (['**`api`**'], ['api']),
+    (['`api', '` more'], ['api more']),
+    # Streamed token by token, a fenced block used to be cut at each newline,
+    # so "```" alone was announced as a code block (twice) around "api".
+    (['``', '`\n', 'api', '\n', '``', '`'], ['api']),
+    (['```text\n', 'localStorage\n', '```\n'], ['localStorage']),
+])
+def test_short_whole_reply_code_is_spoken_on_voice_stream(monkeypatch, tokens, spoken):
+    assert spoken_inputs(monkeypatch, tokens) == spoken
+
+
+def test_streamed_code_block_is_announced_once_after_prose(monkeypatch):
+    tokens = ['Run this:\n', '```python\n', 'def add(a, b):\n',
+              '    return a + b. \n', '```\n', 'That adds them.']
+    spoken = spoken_inputs(monkeypatch, tokens)
+    assert ' '.join(spoken).count('in the chat transcript') == 1
+    assert not any('return' in text for text in spoken)
+    assert spoken[-1].endswith('That adds them.')
+
+
+def test_deadline_never_flushes_an_open_block():
+    now = [0.0]
+    c = tts.SentenceChunker(clock=lambda: now[0])
+    assert c.append('Sure.\n```\nx = 1. ') == []
+    now[0] = 3.0
+    assert c.due() == ['Sure.']
+    assert c.append('y\n```\n') == ['```\nx = 1. y\n```']
+    assert c.flush() == []
+
+
+def test_oversized_block_is_dispatched_and_stays_fenced():
+    c = tts.SentenceChunker()
+    out = c.append('```\n' + 'x = 1\n' * 4000)
+    assert len(out) == 1 and out[0].startswith('```\nx = 1')
+    assert c.pending == '```\n'  # the rest of the block is never read as prose
+    assert c.append('y\n```\n') == ['```\ny\n```']
+
+
 def test_tiny_first_merges_with_long_next():
     c = tts.SentenceChunker()
     assert c.append('Hi. ') == []

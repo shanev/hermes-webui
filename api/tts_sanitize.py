@@ -35,9 +35,6 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_.]{1,%d}" % _MAX_IDENTIFIER_CHARS)
 # the voice says "api models" instead of dropping the span entirely.
 _PATH_SPAN_RE = re.compile(r"[A-Za-z0-9_./]{1,60}")
 
-# Lines captured from fenced blocks by the most recent _strip_fenced_code call.
-FENCED_BLOCK_LINES: list[str] = []
-
 _BACKTICK_FENCE_RE = re.compile(r"`{3,}")
 _QUOTE_PREFIX = r"[ \t]*(?:>[ \t]*)*"
 # A tilde fence must own its line; "~~~struck~~~ text" is not a fence.
@@ -121,49 +118,80 @@ def _code_note(code_blocks: int, dropped_inline: int) -> str:
     return ""
 
 
-def _strip_fenced_code(text: str) -> tuple[str, int]:
-    """Remove fenced code blocks. Returns ``(text, block_count)``.
-    Captured block lines accumulate in FENCED_BLOCK_LINES (module-level, reset
-    per call) so sanitize() can speak a trivial block instead of announcing it."""
-    global FENCED_BLOCK_LINES
-    FENCED_BLOCK_LINES = []
+class _Fences(NamedTuple):
+    text: str  # input with fenced blocks removed
+    count: int  # fenced blocks found (an unclosed one included)
+    lines: list  # block content lines (info strings excluded)
+    spans: list  # (start, end) offsets of each block, fences included
+
+
+def _scan_fences(text: str) -> _Fences:
+    """Find fenced code blocks: one pass shared by stripping and chunking."""
     out = []
+    lines = []
+    spans = []
     count = 0
     fence = None  # (fence character, run length) while inside a block
+    start = 0  # offset where the open block began
+    offset = 0  # offset of the current line
     for line in text.split("\n"):
+        line_end = offset + len(line)
         if fence is not None and fence[0] == "~":
             match = _TILDE_CLOSE_RE.match(line)
             if match and len(match.group(1)) >= fence[1]:
                 fence = None
+                spans.append((start, line_end))
+            else:
+                lines.append(line)
             out.append("")
+            offset = line_end + 1
             continue
         if fence is None:
             match = _TILDE_OPEN_RE.match(line)
             if match:
                 fence = ("~", len(match.group(1)))
                 count += 1
+                start = offset
                 out.append("")
+                offset = line_end + 1
                 continue
         # Backtick fences may open or close mid-line (a client that joined
         # lines, or prose running straight into a fence), so pair runs rather
         # than whole lines. Text outside the runs is kept.
         kept = []
         pos = 0
+        opened_here = False
+        body = 0  # where block content on this line begins
         for match in _BACKTICK_FENCE_RE.finditer(line):
             run = len(match.group())
             if fence is None:
                 kept.append(line[pos:match.start()])
                 fence = ("`", run)
                 count += 1
+                start = offset + match.start()
+                opened_here = True
+                body = match.end()
             elif run >= fence[1]:
+                # "```api```" on one line: its content is "api".
+                lines.append(line[body:match.start()])
                 fence = None
+                spans.append((start, offset + match.end()))
                 pos = match.end()
         if fence is None:
             kept.append(line[pos:])
-        else:
-            FENCED_BLOCK_LINES.append(line)
+        elif not opened_here:
+            lines.append(line)  # an opening line's remainder is its info string
         out.append(" ".join(kept))
-    return "\n".join(out), count
+        offset = line_end + 1
+    if fence is not None:
+        spans.append((start, len(text)))
+    return _Fences("\n".join(out), count, lines, spans)
+
+
+def fenced_spans(text: str) -> list:
+    """``(start, end)`` offsets of each fenced block in ``text``; an unclosed
+    block runs to the end. Lets a streaming chunker avoid cutting inside one."""
+    return _scan_fences(text).spans
 
 
 def _is_rule(line: str) -> bool:
@@ -321,17 +349,18 @@ def sanitize(text) -> SpeechText:
     if not isinstance(text, str) or not text:
         return SpeechText("", "", 0)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text, code_blocks = _strip_fenced_code(text)
+    fences = _scan_fences(text)
+    text, code_blocks = fences.text, fences.count
     text = _flatten_blocks(text)
     text, dropped_inline = _strip_inline(text)
     text = _ENTITY_RE.sub(lambda match: html.unescape(match.group()), text)
     text = _collapse_whitespace(text)
     text, code_blocks, dropped_inline = _speak_trivial_code(
-        text, code_blocks, dropped_inline)
+        text, code_blocks, dropped_inline, fences.lines)
     return SpeechText(text, _code_note(code_blocks, dropped_inline), code_blocks)
 
 
-def _speak_trivial_code(text, code_blocks, dropped_inline):
+def _speak_trivial_code(text, code_blocks, dropped_inline, block_lines):
     """When code IS essentially the whole reply and is short identifier-like
     text, speak it instead of announcing it. A one-word answer like
     ``localStorage`` should be heard, not summarized."""
@@ -345,10 +374,8 @@ def _speak_trivial_code(text, code_blocks, dropped_inline):
         return text, 0, 0  # spoken directly; no note
     # Whole-reply fenced block: speak its single identifier-like line.
     if not text.strip() and code_blocks == 1:
-        candidate = next(
-            (line.strip() for line in FENCED_BLOCK_LINES
-             if line.strip() and not line.strip().startswith("`")),
-            "")
+        content = [line.strip() for line in block_lines if line.strip()]
+        candidate = content[0] if len(content) == 1 else ""
         if candidate and len(candidate) <= _MAX_IDENTIFIER_CHARS \
                 and _IDENTIFIER_RE.fullmatch(candidate):
             # Underscores become spaces so the engine says "my func".
