@@ -31,6 +31,9 @@ MAX_INPUT_CHARS = 50_000
 # Inline code is spoken only when it is a short plain identifier.
 _MAX_IDENTIFIER_CHARS = 20
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_.]{1,%d}" % _MAX_IDENTIFIER_CHARS)
+# Path-like spans ("/api/models", "api/tts/stream"): slashes become spaces so
+# the voice says "api models" instead of dropping the span entirely.
+_PATH_SPAN_RE = re.compile(r"[A-Za-z0-9_./]{1,60}")
 
 # Lines captured from fenced blocks by the most recent _strip_fenced_code call.
 FENCED_BLOCK_LINES: list[str] = []
@@ -279,6 +282,10 @@ def _strip_inline(text: str) -> tuple[str, int]:
             # Underscores become spaces so an engine says "my func", not
             # "my underscore func".
             return " ".join(code.replace("_", " ").split())
+        if _PATH_SPAN_RE.fullmatch(code) and "/" in code:
+            # Route-like span ("/api/models"): speak it with slashes as
+            # spaces rather than dropping the referent entirely.
+            return " ".join(part for part in code.split("/") if part)
         dropped += 1
         return " "
 

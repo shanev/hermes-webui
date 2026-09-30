@@ -464,3 +464,15 @@ def test_code_note_stays_for_multiline_fenced_block():
 def test_code_note_stays_when_fence_has_surrounding_prose():
     result = sanitize("```text\nlocalStorage\n```\nUse that.")
     assert "There is a code block" in result.spoken()
+
+
+def test_path_like_code_span_is_spoken_not_dropped():
+    result = sanitize("our `/api/models` route")
+    assert result.code_note == ""
+    assert "api models" in result.text
+
+
+def test_path_like_code_span_multi_segment():
+    result = sanitize("call the `api/tts/stream` endpoint")
+    assert result.code_note == ""
+    assert "api tts stream" in result.text

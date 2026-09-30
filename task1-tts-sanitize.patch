@@ -1,0 +1,109 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index b1c14cfc..21f5cb86 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -68,6 +68,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
+       startup.py           Startup helpers: auto_install_agent_deps()
+       state_sync.py        /insights sync — message_count to the agent's state.db
+       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
++      tts_sanitize.py      Speech-text normalization for /api/tts (markdown/code -> prose)
+       updates.py           Self-update check and release notes
+       upload.py            Multipart parser, file upload handler
+       voice.py             Voice-turn stage timing log + barge-in interrupt note (in-memory)
+@@ -1527,7 +1528,15 @@ barge-in, or once the turn is 120 s old.
+     /api/chat/start            Optional "voice_turn_id": binds the accepted stream to the turn
+                                (stages first_token, first_sentence from the reply stream).
+     /api/tts                   Optional "turn_id": stamps tts_first_byte when the first
+-                               sentence's audio is ready to send.
++                               sentence's audio is ready to send. "text" is sanitized
++                               for speech before any engine sees it (api/tts_sanitize.py):
++                               markdown syntax is stripped, table rows become sentences,
++                               URLs become "link to <host>", and code is never spoken — a
++                               closing sentence says it is in the chat transcript. The
++                               5000-char cap applies to the sanitized text (raw text is
++                               bounded at 50000); text with nothing speakable -> 400.
++                               With "turn_id", one `voice_tts_sanitize` log line carries
++                               code_blocks, spoken_chars, original_chars.
+     /api/voice/metrics         {"session_id", "turn_id", "stage", "ts"} -> {"ok", "recorded",
+                                "turn_id", "stage"}. Client-observed stages (playback_start).
+                                stage must be one of the six stage names; ts is epoch ms;
+diff --git a/api/routes.py b/api/routes.py
+index 96fc2e32..a2f06f40 100644
+--- a/api/routes.py
++++ b/api/routes.py
+@@ -11280,6 +11280,7 @@ from api.streaming import (
+     _CompactEchoIndex,
+ )
+ from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
++from api import tts_sanitize as _tts_sanitize
+ from api import voice as _voice
+ from api.run_journal import (
+     runtime_model_from_events,
+@@ -20764,7 +20765,21 @@ def _handle_tts(handler, parsed):
+     if not text:
+         from api.helpers import bad as _bad
+         return _bad(handler, "text is required", 400)
+-    if len(text) > 5000:
++    if len(text) > _tts_sanitize.MAX_INPUT_CHARS:
++        from api.helpers import bad as _bad
++        return _bad(handler, "text too long (max 5000 characters)", 400)
++
++    # Speak prose, not syntax: markdown is stripped and code is left out (the
++    # listener is told it is in the chat transcript). Sanitized once, here, so
++    # every engine below receives the same text; the 5000-char cap applies to
++    # what is actually synthesized.
++    original_chars = len(text)
++    speech = _tts_sanitize.sanitize(text)
++    text = speech.spoken()
++    if not text:
++        from api.helpers import bad as _bad
++        return _bad(handler, "no speakable text", 400)
++    if len(text) > _tts_sanitize.MAX_SPEECH_CHARS:
+         from api.helpers import bad as _bad
+         return _bad(handler, "text too long (max 5000 characters)", 400)
+ 
+@@ -20822,6 +20837,14 @@ def _handle_tts(handler, parsed):
+         from api.helpers import bad as _bad
+         return _bad(handler, "rate limit exceeded — please wait", 429)
+ 
++    # Counts only, and only for an admitted request that names a voice turn.
++    _voice.record_tts_sanitize(
++        voice_turn_id,
++        code_blocks=speech.code_blocks,
++        spoken_chars=len(text),
++        original_chars=original_chars,
++    )
++
+     # ── ElevenLabs TTS ──────────────────────────────────────────────────
+     if engine == "elevenlabs":
+         api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+diff --git a/api/voice.py b/api/voice.py
+index 2b14f3c7..5cc7d701 100644
+--- a/api/voice.py
++++ b/api/voice.py
+@@ -287,6 +287,25 @@ def mark_stage(turn_id, stage: str) -> bool:
+     return True
+ 
+ 
++def record_tts_sanitize(turn_id, *, code_blocks, spoken_chars, original_chars) -> bool:
++    """Log what speech sanitization did to one TTS request of a voice turn.
++
++    Counts only. A request without a well-formed turn_id logs nothing; the turn
++    need not still be open, since per-sentence TTS outlives its log line.
++    """
++    if not is_turn_id(turn_id):
++        return False
++    _emit([_log_line({
++        "event": "voice_tts_sanitize",
++        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "turn_id": turn_id,
++        "code_blocks": int(code_blocks),
++        "spoken_chars": int(spoken_chars),
++        "original_chars": int(original_chars),
++    })])
++    return True
++
++
+ def validate_metric_event(payload):
+     """Validate a POST /api/voice/metrics body. Returns ``(event, error)``."""
+     if not isinstance(payload, dict):
