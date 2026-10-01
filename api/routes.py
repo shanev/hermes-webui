@@ -32,7 +32,7 @@ import socket as _socket
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
 from contextlib import closing
-from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit, urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from api.agent_runtime import (
@@ -14782,6 +14782,19 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/session":
         return _handle_session_get(handler, parsed)
+
+    # GET /api/sessions/<sid> — path-style alias used by the Hark voice client
+    # (BackendClient.sessionTranscript). Delegates to the same handler as
+    # /api/session?session_id=<sid>. A missing session 404s there, which the
+    # app treats as the authoritative "gone" signal.
+    if parsed.path.startswith("/api/sessions/") and parsed.path.count("/") == 3:
+        _sid = parsed.path.rsplit("/", 1)[-1]
+        if not _sid:
+            return bad(handler, "session_id required", 400)
+        _q = parse_qs(parsed.query or "")
+        _q["session_id"] = [_sid]
+        _alias = type("_SessionGetQuery", (), {"query": urlencode(_q, doseq=True), "path": parsed.path})()
+        return _handle_session_get(handler, _alias)
 
     if parsed.path == "/api/session/lineage/report":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
