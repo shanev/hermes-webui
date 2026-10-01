@@ -20708,6 +20708,25 @@ def _tts_open(req, *, timeout=30, opener_factory=None):
     return _urlopen(req, timeout=timeout)
 
 
+def _tts_failure_outcome(exc):
+    """Classify an upstream TTS failure as "timeout" or "error"."""
+    if isinstance(exc, (TimeoutError, _socket.timeout)):
+        return "timeout"
+    if isinstance(exc, URLError) and isinstance(exc.reason, (TimeoutError, _socket.timeout)):
+        return "timeout"
+    return "error"
+
+
+def _log_tts_outcome(engine, model, text_chars, outcome, started):
+    """One line per upstream TTS call, successes included, so the failure rate
+    and latency are measurable from the log alone. No text or credentials."""
+    logger.log(
+        logging.INFO if outcome == "success" else logging.WARNING,
+        "TTS request engine=%s model=%s text_chars=%d outcome=%s duration_ms=%d",
+        engine, model, text_chars, outcome, int((time.monotonic() - started) * 1000),
+    )
+
+
 def _handle_tts(handler, parsed):
     """Generate TTS audio via supported server TTS engines. POST JSON body only.
 
@@ -20909,17 +20928,21 @@ def _handle_tts(handler, parsed):
         # chunked-read path adds per-chunk overhead that dominates short TTS
         # payloads. A hard cap keeps the buffered path bounded even if the
         # upstream misbehaves.
+        started = time.monotonic()
         try:
             with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler())) as resp:
                 audio_data = _buffer_tts_audio_response(resp)
         except ValueError:
+            _log_tts_outcome("elevenlabs", model_id, len(text), "error", started)
             logger.warning("ElevenLabs TTS rejected an invalid upstream response", exc_info=True)
             from api.helpers import bad as _bad
             return _bad(handler, "ElevenLabs TTS generation failed", 502)
-        except Exception:
+        except Exception as exc:
+            _log_tts_outcome("elevenlabs", model_id, len(text), _tts_failure_outcome(exc), started)
             logger.exception("ElevenLabs TTS generation failed")
             from api.helpers import bad as _bad
             return _bad(handler, "ElevenLabs TTS generation failed", 500)
+        _log_tts_outcome("elevenlabs", model_id, len(text), "success", started)
 
         _voice.mark_stage(voice_turn_id, "tts_first_byte")
         handler.send_response(200)
@@ -20993,17 +21016,21 @@ def _handle_tts(handler, parsed):
         # Use a pinned HTTPS opener so the resolved address is the one that gets
         # dialed. Keep the no-redirect handler in the same chain to block
         # bearer leaks and SSRF bounce redirects after hostname validation.
+        started = time.monotonic()
         try:
             with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler(), _PinnedHTTPSHandler())) as resp:
                 audio_data = _buffer_tts_audio_response(resp)
         except ValueError:
+            _log_tts_outcome("openai", model, len(text), "error", started)
             logger.warning("OpenAI TTS rejected an invalid upstream response", exc_info=True)
             from api.helpers import bad as _bad
             return _bad(handler, "OpenAI TTS generation failed", 502)
-        except Exception:
+        except Exception as exc:
+            _log_tts_outcome("openai", model, len(text), _tts_failure_outcome(exc), started)
             logger.exception("OpenAI TTS generation failed")
             from api.helpers import bad as _bad
             return _bad(handler, "OpenAI TTS generation failed", 500)
+        _log_tts_outcome("openai", model, len(text), "success", started)
 
         _voice.mark_stage(voice_turn_id, "tts_first_byte")
         handler.send_response(200)

@@ -542,3 +542,57 @@ def test_boot_js_handles_openai_engine():
     src = (STATIC_DIR / "boot.js").read_text(encoding="utf-8")
     assert 'if(engine==="openai")' in src
     assert "body: JSON.stringify({text: clean, engine: 'openai'})" in src
+
+
+def _tts_outcome_records(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith("TTS request ")]
+
+
+def test_openai_tts_logs_success_outcome_with_latency(monkeypatch, caplog):
+    # Successes are logged too, so the upstream failure rate is measurable.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    monkeypatch.setattr(routes, "_tts_open", lambda req, **kw: _StreamOnceResponse([b"ok"]))
+    caplog.set_level("INFO", logger="api.routes")
+    h = _post({"text": "Hello there", "engine": "openai"}, client="10.82.0.40")
+    routes._handle_tts(h, None)
+
+    assert h.status == 200
+    (rec,) = _tts_outcome_records(caplog)
+    msg = rec.getMessage()
+    assert rec.levelname == "INFO"
+    assert "engine=openai model=gpt-4o-mini-tts text_chars=11 outcome=success" in msg
+    assert "duration_ms=" in msg
+    assert "Hello there" not in msg and "sk-openai" not in msg
+
+
+@pytest.mark.parametrize("exc", [TimeoutError("The read operation timed out"),
+                                 routes.URLError(socket.timeout("timed out"))])
+def test_openai_tts_logs_timeout_outcome(monkeypatch, caplog, exc):
+    def _timeout(req, **kw):
+        raise exc
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    monkeypatch.setattr(routes, "_tts_open", _timeout)
+    caplog.set_level("INFO", logger="api.routes")
+    h = _post({"text": "Hello", "engine": "openai"}, client="10.82.0.41")
+    routes._handle_tts(h, None)
+
+    assert h.status == 500
+    (rec,) = _tts_outcome_records(caplog)
+    assert rec.levelname == "WARNING"
+    assert "outcome=timeout" in rec.getMessage()
+
+
+def test_openai_tts_logs_error_outcome(monkeypatch, caplog):
+    def _refused(req, **kw):
+        raise routes.URLError(ConnectionRefusedError("refused"))
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    monkeypatch.setattr(routes, "_tts_open", _refused)
+    caplog.set_level("INFO", logger="api.routes")
+    h = _post({"text": "Hello", "engine": "openai"}, client="10.82.0.42")
+    routes._handle_tts(h, None)
+
+    assert h.status == 500
+    (rec,) = _tts_outcome_records(caplog)
+    assert "outcome=error" in rec.getMessage()
