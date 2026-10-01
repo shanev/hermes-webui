@@ -541,8 +541,15 @@ def handle_transcribe(handler):
             msg = str(result.get('error') or 'Transcription failed')
             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
             # Voice clients only surface the status code — log WHY so a remote
-            # 400 is diagnosable from the server alone.
-            print(f'[webui] transcribe 400: {msg[:200]}', flush=True)
+            # 400 is diagnosable from the server alone, and keep the offending
+            # file for forensics (pruned by the scratch cleaner).
+            import shutil as _shutil
+            keep = f'/Users/vega/.hermes/cache/scratch/transcribe-fail{suffix}'
+            try:
+                _shutil.copyfile(temp_path, keep)
+            except Exception:
+                pass
+            print(f'[webui] transcribe 400: {msg[:200]} (saved {keep})', flush=True)
             return j(handler, {'error': msg}, status=status)
         transcript = str(result.get('transcript') or '').strip()
         # turn_id lets the voice client correlate this transcription with the
