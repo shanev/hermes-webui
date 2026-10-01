@@ -528,6 +528,7 @@ def handle_transcribe(handler):
             return j(handler, {'error': 'No filename in upload'}, status=400)
         safe_name = _sanitize_upload_name(filename)
         suffix = Path(safe_name).suffix or '.webm'
+        print(f'[webui] transcribe upload: {safe_name} {len(file_bytes)}B', flush=True)
         with tempfile.NamedTemporaryFile(prefix='webui-stt-', suffix=suffix, delete=False) as tmp:
             temp_path = tmp.name
             tmp.write(file_bytes)
@@ -539,6 +540,9 @@ def handle_transcribe(handler):
         if not result.get('success'):
             msg = str(result.get('error') or 'Transcription failed')
             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
+            # Voice clients only surface the status code — log WHY so a remote
+            # 400 is diagnosable from the server alone.
+            print(f'[webui] transcribe 400: {msg[:200]}', flush=True)
             return j(handler, {'error': msg}, status=status)
         transcript = str(result.get('transcript') or '').strip()
         # turn_id lets the voice client correlate this transcription with the
