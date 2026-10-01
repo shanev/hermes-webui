@@ -537,6 +537,18 @@ def handle_transcribe(handler):
         except ImportError:
             return j(handler, {'error': 'Speech-to-text is unavailable on this server'}, status=503)
         result = transcribe_audio(temp_path)
+        if not result.get('success') and result.get('no_speech'):
+            # xAI's VAD gates quiet/short clips (mid-reply interruptions capture
+            # ducked mic audio) as silence. Silence is not an error: mint the
+            # turn and answer 200 with an empty transcript — the client treats
+            # it like an empty utterance instead of surfacing a 400.
+            session_id = fields.get('session_id', '')
+            turn_id = _voice.begin_turn(
+                session_id if is_safe_session_id(session_id) and len(session_id) <= 128 else None,
+                transcribe_start_ms=transcribe_start_ms,
+            )
+            print('[webui] transcribe: no speech detected (silent clip)', flush=True)
+            return j(handler, {'ok': True, 'transcript': '', 'turn_id': turn_id})
         if not result.get('success'):
             msg = str(result.get('error') or 'Transcription failed')
             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
