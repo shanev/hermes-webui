@@ -547,7 +547,10 @@ def handle_transcribe(handler):
                 session_id if is_safe_session_id(session_id) and len(session_id) <= 128 else None,
                 transcribe_start_ms=transcribe_start_ms,
             )
-            print('[webui] transcribe: no speech detected (silent clip)', flush=True)
+            # No reply follows a silent clip: close its line now so it is not
+            # later flushed as a "timeout" turn indistinguishable from a hang.
+            _voice.close_turn(turn_id, 'no_speech')
+            print(f'[webui] transcribe: no speech detected (silent clip) turn_id={turn_id}', flush=True)
             return j(handler, {'ok': True, 'transcript': '', 'turn_id': turn_id})
         if not result.get('success'):
             msg = str(result.get('error') or 'Transcription failed')

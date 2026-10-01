@@ -377,10 +377,16 @@ def test_wedged_voice_turn_deadline_force_finalizes_and_retry_succeeds(monkeypat
     sid, stream_id = "hark13_wedged", "stream_hark13_wedged"
     session = FakeSession(sid, stream_id)
     in_tool, release = threading.Event(), threading.Event()
+    successor_release = threading.Event()
     lines = []
     monkeypatch.setattr(voice, "emit_request_log", lines.append)
 
     def run(agent, **_kw):
+        if in_tool.is_set():
+            # The successor admitted after the deadline really runs (no turn
+            # waits on the wedged worker's skill-home hold); keep it in flight.
+            successor_release.wait(10)
+            return "successor answer"
         in_tool.set()
         release.wait(30)  # a tool call that never returns (ignores interrupt)
         return "late answer from the wedged worker"
@@ -431,6 +437,7 @@ def test_wedged_voice_turn_deadline_force_finalizes_and_retry_succeeds(monkeypat
         assert not worker.is_alive()
     assert session.active_stream_id == "new-stream"
     assert all(m.get("content") != "late answer from the wedged worker" for m in session.messages)
+    successor_release.set()
 
 
 def test_deadline_stamp_makes_cancelling_row_immediately_stale():
@@ -495,7 +502,115 @@ def test_normal_voice_turn_with_live_consumer_is_unchanged():
     assert not turn_liveness.is_voice_stream(stream_id)
 
 
-# ── 5. Env override ───────────────────────────────────────────────────────────
+# ── 5. Barge-in: a new turn never waits on a running turn's skill-home hold ──
+
+
+def test_voice_turn_reaches_the_model_while_another_turn_is_mid_reply(monkeypatch):
+    """A voice turn started while an earlier turn is still running reaches its
+    model call promptly.
+
+    Before the fix, static skill modules made every turn hold the process-wide
+    skill-home lock until its outer teardown. A second turn on any session (a
+    barge-in, or Hark's 409 fork to a fresh session) parked before building its
+    Agent: no model call, no token, "Thinking" until the first turn ended. The
+    first turn is never cancelled here.
+    """
+    import api.profiles as profiles
+
+    # Force the static-module (legacy) path the stall needs.
+    monkeypatch.setattr(streaming, "_set_streaming_hermes_home_override", lambda home: (None, None, False))
+    busy = FakeSession("hark13_busy", "stream_hark13_busy")
+    nxt = FakeSession("hark13_next", "stream_hark13_next")
+    sessions = {busy.session_id: busy, nxt.session_id: nxt}
+    a_streaming, a_release, b_entered = threading.Event(), threading.Event(), threading.Event()
+    stages = []
+    monkeypatch.setattr(voice, "note_worker_stage", lambda sid, stage: stages.append((sid, stage)))
+
+    def run(agent, **kw):
+        if kw.get("task_id", agent.session_id) == busy.session_id:
+            agent.stream_delta_callback("A long spoken reply. ")
+            a_streaming.set()
+            assert a_release.wait(10), "test never released the first turn"
+            return "A done."
+        b_entered.set()
+        agent.stream_delta_callback("B reply. ")
+        return "B done."
+
+    with _agent_runtime(_agent_class(run), busy), \
+         mock.patch.object(streaming, "get_session", side_effect=lambda sid, *a, **k: sessions[sid]):
+        _c1, a_worker = _launch(busy, busy.active_stream_id, voice_turn=True)
+        try:
+            assert a_streaming.wait(5)
+            assert profiles._SKILL_HOME_MODULE_PATCH_LOCK.holder_count() == 1
+            started = time.monotonic()
+            _c2, b_worker = _launch(nxt, nxt.active_stream_id, voice_turn=True)
+            assert b_entered.wait(5), "second turn stalled before its model call while the first turn ran"
+            assert time.monotonic() - started < 5
+            b_worker.join(10)
+            assert not b_worker.is_alive()
+            assert a_worker.is_alive()  # the first turn kept running
+        finally:
+            a_release.set()
+            a_worker.join(10)
+    assert not a_worker.is_alive()
+    assert nxt.messages[-1].get("content") == "B done."
+    assert busy.messages[-1].get("content") == "A done."
+    assert profiles._SKILL_HOME_MODULE_PATCH_LOCK.holder_count() == 0
+    b_stages = [stage for sid, stage in stages if sid == "stream_hark13_next"]
+    assert "skill_home_acquired" in b_stages and "model_call" in b_stages and "first_token" in b_stages
+
+
+def test_skill_home_lease_shares_one_home_and_bounds_a_different_one(tmp_path):
+    import api.profiles as profiles
+
+    lease = profiles._SkillHomeModuleLease()
+    calls = []
+    hooks = dict(
+        snapshot=lambda: calls.append("snapshot") or {"snap": 1},
+        patch=lambda path: calls.append(("patch", path)),
+        restore=lambda snap: calls.append(("restore", snap)),
+    )
+    alpha, beta = tmp_path / "alpha", tmp_path / "beta"
+    outcome = {}
+
+    def other_thread(name, home, timeout):
+        got = lease.acquire(timeout=timeout, home=home, **hooks)
+        outcome[name] = got
+        if got:
+            lease.release()
+
+    assert lease.acquire(home=alpha, **hooks)
+    same = threading.Thread(target=other_thread, args=("same", alpha, 1.0))
+    same.start()
+    same.join(5)
+    assert outcome["same"] is True  # same home: joined without waiting
+    started = time.monotonic()
+    other = threading.Thread(target=other_thread, args=("other", beta, 0.2))
+    other.start()
+    other.join(5)
+    assert outcome["other"] is False  # different home: bounded refusal
+    assert time.monotonic() - started < 2
+    assert calls == ["snapshot", ("patch", alpha)]  # one patch for the shared home
+
+    # Same-thread re-entry for another home patches/restores only itself.
+    assert lease.acquire(home=beta, **hooks)
+    assert calls[-1] == ("patch", beta)
+    lease.release()
+    assert calls[-1] == ("restore", {"snap": 1}) and lease.holder_count() == 1
+
+    lease.release()
+    assert calls[-1] == ("restore", {"snap": 1})
+    assert lease.holder_count() == 0
+    with pytest.raises(RuntimeError):
+        lease.release()
+    # Drained: the other home is admitted now.
+    late = threading.Thread(target=other_thread, args=("late", beta, 1.0))
+    late.start()
+    late.join(5)
+    assert outcome["late"] is True
+
+
+# ── 6. Env override ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("raw,expected", [

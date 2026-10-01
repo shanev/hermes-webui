@@ -104,6 +104,10 @@ _INTERRUPT_NOTES: "OrderedDict[str, float]" = OrderedDict()  # session_id -> arm
 # session_id -> (stream_id, armed_at). Bound to the stream it was armed for, so
 # a turn that never drained it cannot hand the directive to a later turn.
 _VOICE_MODE_NOTES: "OrderedDict[str, tuple]" = OrderedDict()
+# stream_id -> last worker startup stage (api.streaming.log_turn_stage). Keyed
+# by stream, not turn: the worker can start before chat/start binds the turn.
+_WORKER_STAGES: "OrderedDict[str, str]" = OrderedDict()
+_MAX_WORKER_STAGES = 1024
 
 
 def now_ms() -> int:
@@ -149,6 +153,14 @@ def _turn_line_locked(rec: dict, closed_by: str) -> str:
         payload["truncated_chars"] = int(rec["truncated_chars"] or 0)
     if rec.get("detached"):
         payload["detached"] = True
+    # A lazily swept line is written when a LATER turn arrives, so "ts" is not
+    # when this turn opened; opened_at is.
+    payload["opened_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(rec["created"]))
+    if rec.get("chat_start"):
+        payload["chat_start"] = dict(rec["chat_start"])
+    worker_stage = _WORKER_STAGES.get(rec["stream_id"]) if rec["stream_id"] else None
+    if worker_stage:
+        payload["worker_stage"] = worker_stage
     return _log_line(payload)
 
 
@@ -234,6 +246,81 @@ def bind_stream(turn_id, session_id, stream_id) -> bool:
         rec["stream_id"] = stream_id
         _AWAITING_REPLY[stream_id] = rec["turn_id"]
     return True
+
+
+def record_chat_start(turn_id, session_id, *, status: int, stream_id=None, bound: bool = False, error=None) -> None:
+    """Make a voice turn's chat/start outcome observable.
+
+    Stamps the outcome on the turn (it appears as ``chat_start`` in the turn's
+    line) and, when the turn did NOT end up bound to a stream — a rejected
+    start (e.g. a 409 while an earlier run owns the session) or a failed bind —
+    writes a ``voice_chat_start`` line naming why. Without this a turn whose
+    stream was never bound times out with every reply stage null, which reads
+    exactly like a hung worker. ``error`` is a server-generated message.
+    """
+    session_id = str(session_id or "").strip() or None
+    status = int(status or 0)
+    with _LOCK:
+        rec = _TURNS.get(turn_id) if is_turn_id(turn_id) else None
+        if rec is None:
+            reason = "unknown_turn"
+        elif rec["session_id"] and session_id and rec["session_id"] != session_id:
+            reason = "foreign_turn"
+            rec = None
+        elif bound:
+            reason = None
+        elif status != 200:
+            reason = "rejected"
+        elif rec["emitted"]:
+            reason = "turn_closed"
+        elif rec["stream_id"] and rec["stream_id"] != stream_id:
+            reason = "already_bound"
+        else:
+            reason = "bind_failed"
+        if rec is not None and not rec["emitted"]:
+            rec["chat_start"] = {"status": status, "bound": bool(bound)}
+    if reason is None:
+        return
+    _emit([_log_line({
+        "event": "voice_chat_start",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "turn_id": turn_id if is_turn_id(turn_id) else None,
+        "session_id": session_id,
+        "stream_id": stream_id,
+        "status": status,
+        "reason": reason,
+        "error": str(error)[:160] if error else None,
+    })])
+
+
+def close_turn(turn_id, closed_by: str) -> bool:
+    """Write a turn's line now (e.g. ``no_speech``: no reply will follow)."""
+    if not is_turn_id(turn_id):
+        return False
+    lines = []
+    with _LOCK:
+        rec = _TURNS.get(turn_id)
+        if rec is not None and not rec["emitted"]:
+            if rec["stream_id"] and _AWAITING_REPLY.get(rec["stream_id"]) == turn_id:
+                _AWAITING_REPLY.pop(rec["stream_id"], None)
+            lines.append(_turn_line_locked(rec, closed_by))
+    _emit(lines)
+    return bool(lines)
+
+
+def note_worker_stage(stream_id, stage) -> None:
+    """Remember the last startup stage a chat worker reached. Never raises."""
+    stream_id = str(stream_id or "").strip()
+    if not stream_id or not stage:
+        return
+    try:
+        with _LOCK:
+            _WORKER_STAGES.pop(stream_id, None)
+            _WORKER_STAGES[stream_id] = str(stage)
+            while len(_WORKER_STAGES) > _MAX_WORKER_STAGES:
+                _WORKER_STAGES.popitem(last=False)
+    except Exception:
+        pass
 
 
 def _first_sentence_complete(rec: dict, text: str) -> bool:
@@ -552,3 +639,4 @@ def reset_for_tests() -> None:
         _AWAITING_REPLY.clear()
         _INTERRUPT_NOTES.clear()
         _VOICE_MODE_NOTES.clear()
+        _WORKER_STAGES.clear()

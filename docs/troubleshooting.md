@@ -114,7 +114,10 @@ third-party packages. It must **not** import `run_agent` at that point:
 `api.config` first selects the active profile, then profile-sensitive Agent
 application modules can be imported. Importing skills under the launch/base home
 before selecting a named profile can disable their context-local home resolution
-and force turns and model-catalog scopes into the legacy whole-turn lock.
+and force turns and model-catalog scopes onto the legacy skill-home lease. Turns
+on the same profile home share that lease and run concurrently; a turn that
+needs a different home waits up to 30 seconds, then fails with an error instead
+of stalling.
 
 The dependency layer retains Agent-owned activation and re-exec behavior; WebUI
 does not choose generation directories or install into an obsolete Agent venv.
@@ -132,6 +135,27 @@ Current Hermes managed environments ship `ruamel.yaml` and may not include
 PyYAML. WebUI reads and writes YAML through `api/yaml_compat.py`, which uses
 PyYAML when it is importable and falls back to `ruamel.yaml` otherwise, and the
 bootstrap probe accepts either backend.
+
+---
+
+## A turn sits in "Thinking" with no tokens
+
+Each chat worker logs one `[webui] {"event":"turn_stage",...}` line per startup
+stage, keyed by `stream_id`: `worker_started`, `session_loaded`,
+`skill_home_wait` / `skill_home_acquired` (legacy skill modules only; `holders`
+is the lease's holder count when the turn arrived), `env_ready`, `mcp_ready`,
+`runtime_resolved`, `agent_ready`, `user_message_saved`, `model_call`,
+`first_token`, `model_returned` and `worker_end` (Gateway turns log
+`model_call`, `gateway_connected` and `first_token`). `t_ms` is the time since
+the worker started. The last stage logged for a stuck stream shows where it
+stopped.
+
+For voice turns, the `voice_turn` line also names the last `worker_stage`, the
+`chat_start` outcome and `opened_at`. A timed-out line is written lazily when
+the NEXT voice turn arrives, so its `ts` is not when the turn opened. A
+`voice_chat_start` line means the turn never got a bound stream: the start was
+rejected (for example a 409 while an earlier run owns the session) or the bind
+failed. Silent clips close at once as `closed_by:"no_speech"`.
 
 ---
 

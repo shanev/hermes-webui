@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -62,7 +63,132 @@ _tls = threading.local()
 _PROCESS_PROFILE_HOME: Optional[str] = None
 
 _SKILL_HOME_MODULES = ("tools.skills_tool", "tools.skill_manager_tool")
-_SKILL_HOME_MODULE_PATCH_LOCK = threading.RLock()
+
+
+class _SkillHomeModuleLease:
+    """Process-wide hold on the legacy skill modules' cached path globals.
+
+    Static skill modules cache ``HERMES_HOME``/``SKILLS_DIR`` at import, so a
+    scope that needs another profile's skills patches them for its lifetime.
+    The globals hold ONE value, so only scopes that need the SAME home can
+    share them: the first holder snapshots and patches, later same-home
+    holders join without waiting, and the last one out restores. A scope that
+    needs a different home waits until the lease drains.
+
+    This used to be a plain RLock held for a whole streaming turn, which
+    serialized every concurrent turn in the process behind one another even
+    when they all wanted the same home: a voice barge-in turn (or a turn on a
+    freshly forked session) sat before its first model call until the earlier
+    turn and its writeback finished. Worse, a holder's patch made every other
+    turn's dynamic-capability check fail (``SKILLS_DIR`` no longer matches the
+    import baseline), pushing them all onto this path.
+
+    ``acquire()`` without ``home`` is an exclusive, lock-compatible hold.
+    Re-entry by a thread that already holds the lease is always admitted
+    (RLock parity); a nested different home is patched and restored by that
+    nested scope only while this thread is the sole holder, otherwise it waits.
+    State layer: process-local module globals; lock order: this lease's
+    condition is a leaf (no other lock is taken while it is held).
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._home = None  # key of the home shared by current holders
+        # thread ident -> stack of (home key, restore callable or None)
+        self._holds: dict[int, list] = {}
+        self._restore = None  # first holder's restore, run by the last release
+        self._nested = 0  # active nested different-home patches
+
+    @staticmethod
+    def _key(home):
+        return None if home is None else str(Path(home).expanduser())
+
+    def _admissible_locked(self, key, me) -> bool:
+        if not self._holds:
+            return True
+        if me in self._holds:
+            return key is None or key == self._home or list(self._holds) == [me]
+        # While a nested patch is live the globals do not show the shared home.
+        return key is not None and key == self._home and not self._nested
+
+    @staticmethod
+    def _patch(key, snapshot, patch, restore):
+        """Snapshot then patch; a failed patch restores and admits nothing."""
+        taken = snapshot()
+        try:
+            patch(Path(key))
+        except BaseException:
+            restore(taken)
+            raise
+        return taken
+
+    def holder_count(self) -> int:
+        with self._cond:
+            return sum(len(stack) for stack in self._holds.values())
+
+    def acquire(self, blocking=True, timeout=-1, *, home=None,
+                snapshot=None, patch=None, restore=None) -> bool:
+        """Hold the lease; with ``home``, the skill modules resolve to it.
+
+        ``snapshot``/``patch``/``restore`` default to this module's helpers
+        (looked up at call time so tests can substitute them). Returns False
+        when the wait is not admitted within ``timeout`` (or ``blocking`` is
+        False); the caller then holds nothing.
+        """
+        key = self._key(home)
+        me = threading.get_ident()
+        deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+        with self._cond:
+            while not self._admissible_locked(key, me):
+                if not blocking:
+                    return False
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            snapshot = snapshot or (lambda: snapshot_skill_home_modules())
+            patch = patch or (lambda path: patch_skill_home_modules(path))
+            restore = restore or (lambda snap: restore_skill_home_modules(snap))
+            nested_restore = None
+            if not self._holds:
+                if key is not None:
+                    taken = self._patch(key, snapshot, patch, restore)
+                    self._restore = lambda: restore(taken)
+                self._home = key
+            elif key is not None and key != self._home:
+                # Sole holder re-entering for another home (RLock parity).
+                taken = self._patch(key, snapshot, patch, restore)
+                nested_restore = lambda: restore(taken)
+                self._nested += 1
+            self._holds.setdefault(me, []).append((key, nested_restore))
+            return True
+
+    def release(self) -> None:
+        me = threading.get_ident()
+        with self._cond:
+            stack = self._holds.get(me)
+            if not stack:
+                raise RuntimeError("cannot release an un-acquired skill-home lease")
+            _key, nested_restore = stack.pop()
+            if not stack:
+                del self._holds[me]
+            if nested_restore is not None:
+                self._nested -= 1
+                try:
+                    nested_restore()
+                finally:
+                    self._cond.notify_all()
+            if self._holds:
+                return
+            final_restore, self._restore, self._home = self._restore, None, None
+            try:
+                if final_restore is not None:
+                    final_restore()
+            finally:
+                self._cond.notify_all()
+
+
+_SKILL_HOME_MODULE_PATCH_LOCK = _SkillHomeModuleLease()
 
 
 def snapshot_skill_home_modules() -> dict[str, dict[str, object]]:
@@ -1235,7 +1361,6 @@ def profile_env_for_background_worker(
     # worker body because several production Hermes readers still call
     # os.getenv() directly for provider credentials.  Keep the _ENV_LOCK scope
     # narrow: serialize only setup/restore, not the whole worker body.
-    skill_home_snapshot = None
     old_runtime_env: dict[str, Optional[str]] = {}
     old_hermes_home = None
     had_hermes_home = False
@@ -1299,22 +1424,17 @@ def profile_env_for_background_worker(
                     has_profile_skill_home = False
 
             # #5567-fallback: if override is unavailable, or module-side
-            # profile resolution is missing/failed, serialize the full worker
-            # lifespan under the shared legacy patch lock.
+            # profile resolution is missing/failed, hold the shared legacy
+            # skill-home lease (patched to this home) for the worker lifespan.
+            # Same-home scopes share it; a different home waits.
             should_restore_skill_modules = not (
                 _home_override_installed and has_profile_skill_home
             )
             if should_restore_skill_modules:
-                _SKILL_HOME_MODULE_PATCH_LOCK.acquire()
+                _SKILL_HOME_MODULE_PATCH_LOCK.acquire(home=profile_home_path)
                 _acquired_skill_home_patch_lock = True
 
         with _ENV_LOCK:
-            if scope_skill_modules and should_restore_skill_modules:
-                # Snapshot and patch before mutating process env so setup
-                # failures can unwind without leaking either state.
-                skill_home_snapshot = snapshot_skill_home_modules()
-                patch_skill_home_modules(profile_home_path)
-
             old_runtime_env = _apply_profile_env_to_process(
                 os.environ,
                 safe_runtime_env,
@@ -1337,10 +1457,9 @@ def profile_env_for_background_worker(
                     os.environ["HERMES_HOME"] = old_hermes_home or ""
                 else:
                     os.environ.pop("HERMES_HOME", None)
-                if should_restore_skill_modules and skill_home_snapshot is not None:
-                    restore_skill_home_modules(skill_home_snapshot)
         finally:
             if _acquired_skill_home_patch_lock:
+                # The last holder out restores the skill-module globals.
                 _SKILL_HOME_MODULE_PATCH_LOCK.release()
                 _acquired_skill_home_patch_lock = False
             # Reset context-local state after the fallback globals are restored.

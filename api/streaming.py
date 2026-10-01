@@ -401,6 +401,47 @@ def _cancel_event_payload(
 # (api/profiles.py:715).
 _ENV_LOCK = threading.Lock()
 
+# Bound on a turn's wait for the legacy skill-home lease when another scope
+# holds it for a DIFFERENT profile home (same-home turns never wait). Past it
+# the turn fails with an error event instead of stalling before its first
+# model call.
+_SKILL_HOME_LEASE_WAIT_SECONDS = 30.0
+
+
+def _skill_home_holder_count(lease) -> int:
+    counter = getattr(lease, "holder_count", None)
+    try:
+        return int(counter()) if callable(counter) else -1
+    except Exception:
+        return -1
+
+
+def log_turn_stage(stream_id, session_id, started_monotonic, stage, **extra) -> None:
+    """Worker startup/first-token stage diagnostics. Never raises.
+
+    One ``[webui]`` JSON line per stage (ids, stage name and elapsed ms only),
+    and the voice turn bound to ``stream_id`` (if any) remembers the last
+    stage, so a voice turn that times out names where its worker stopped.
+    """
+    try:
+        payload = {
+            "event": "turn_stage",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "stream_id": stream_id,
+            "session_id": session_id,
+            "stage": stage,
+            "t_ms": int((time.monotonic() - started_monotonic) * 1000),
+        }
+        payload.update(extra)
+        print("[webui] " + json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str), flush=True)
+    except Exception:
+        pass
+    try:
+        _voice.note_worker_stage(stream_id, stage)
+    except Exception:
+        pass
+
+
 _STREAM_WRITEBACK_DIAG_DEFAULT_THRESHOLD_MS = 250.0
 
 _STREAMING_CRON_PROFILE_HOME: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -9759,6 +9800,13 @@ def _run_agent_streaming(
     """
     _turn_route_model = model
     _turn_route_provider = model_provider
+    _turn_stage_t0 = time.monotonic()
+
+    _first_token_staged = [False]
+
+    def _turn_stage(stage, **extra):
+        log_turn_stage(stream_id, session_id, _turn_stage_t0, stage, **extra)
+
     cancel_event = threading.Event()
     q = peek_stream(stream_id)
     if q is not None:
@@ -9797,7 +9845,9 @@ def _run_agent_streaming(
                 "Failed to clear session writeback owner for stream %s", stream_id,
                 exc_info=True,
             )
+        _turn_stage('worker_cancelled_before_start')
         return
+    _turn_stage('worker_started')
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
@@ -10286,8 +10336,6 @@ def _run_agent_streaming(
     _streaming_cron_profile_home_token = None
     _turn_pending_source = 'webui'
     _streaming_hermes_home_override_ctx = (None, None, False)
-    _streaming_skill_home_snapshot = None
-    _restore_streaming_skill_home_modules = False
     _acquired_streaming_skill_home_patch_lock = False
     def _register_agent_if_current(candidate, cache_signature=None):
         nonlocal agent
@@ -10388,6 +10436,7 @@ def _run_agent_streaming(
         # session's own record cannot disagree. Guarded: a turn must not die
         # here because a workspace path is malformed.
         s = get_session(session_id)
+        _turn_stage('session_loaded')
         try:
             _turn_workspace_cwd = str(_resolve_path(workspace, profile=getattr(s, 'profile', None)))
         except Exception:
@@ -10532,9 +10581,12 @@ def _run_agent_streaming(
         _prewarm_skill_tool_modules()
         _install_streaming_cronjob_profile_wrapper()
 
-        # Full-turn serialization is only needed for static/legacy skill-module
-        # resolution, where process-global skill-module globals are still used.
-        # Dynamic-capable modules continue concurrent execution.
+        # Static/legacy skill modules resolve skills from process-global module
+        # globals, so this turn holds the shared skill-home lease patched to its
+        # profile home. Turns on the same home share it and run concurrently; a
+        # turn needing another home waits, bounded, then fails visibly instead
+        # of stalling before its first model call. Dynamic-capable modules
+        # skip the lease entirely.
         _streaming_override_installed = bool(_streaming_hermes_home_override_ctx[2])
         _streaming_modules_are_dynamic = False
         if patch_skill_home_modules is not None and snapshot_skill_home_modules is not None:
@@ -10552,20 +10604,28 @@ def _run_agent_streaming(
                     _streaming_modules_are_dynamic = False
 
             if not (_streaming_override_installed and _streaming_modules_are_dynamic):
-                _restore_streaming_skill_home_modules = True
-                _SKILL_HOME_MODULE_PATCH_LOCK.acquire()
+                _turn_stage('skill_home_wait', holders=_skill_home_holder_count(_SKILL_HOME_MODULE_PATCH_LOCK))
+                if not _SKILL_HOME_MODULE_PATCH_LOCK.acquire(
+                    timeout=_SKILL_HOME_LEASE_WAIT_SECONDS,
+                    home=Path(_profile_home),
+                    snapshot=lambda: snapshot_skill_home_modules(),
+                    patch=lambda path: patch_skill_home_modules(path),
+                    restore=lambda snap: restore_skill_home_modules(snap),
+                ):
+                    _turn_stage('skill_home_timeout')
+                    raise RuntimeError(
+                        "Another chat turn is using a different profile's skills; "
+                        f"this turn waited {int(_SKILL_HOME_LEASE_WAIT_SECONDS)}s for it "
+                        "and did not start. Send the message again once it finishes."
+                    )
                 _acquired_streaming_skill_home_patch_lock = True
+                _turn_stage('skill_home_acquired')
 
         # Still set process-level env as fallback for tools that bypass thread-local
         # Acquire lock only for the env mutation, then release before the agent runs.
         # The finally block re-acquires to restore — keeping critical sections short
         # and preventing a deadlock where the restore would re-enter the same lock.
         with _ENV_LOCK:
-            if _restore_streaming_skill_home_modules:
-                # Snapshot and patch before mutating process env so setup
-                # failures can unwind without leaking either state.
-                _streaming_skill_home_snapshot = snapshot_skill_home_modules()
-                patch_skill_home_modules(Path(_profile_home))
             old_profile_env = {key: os.environ.get(key) for key in _safe_profile_runtime_env}
             old_cwd = os.environ.get('TERMINAL_CWD')
             old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
@@ -10606,12 +10666,14 @@ def _run_agent_streaming(
         # mirror above would make this turn's own profile look like the process
         # profile, falling back to bare, cross-profile names, unless the agent
         # honours the pin from `api.profiles._pin_process_profile_home()`.
+        _turn_stage('env_ready')
         try:
             from api.agent_compat import agent_attr
             discover_mcp_tools = agent_attr("tools.mcp_tool", "discover_mcp_tools", "tools.mcp_tool_discovery")
             discover_mcp_tools()
         except Exception:
             pass  # MCP not available or not configured — non-fatal
+        _turn_stage('mcp_ready')
 
         # Register a gateway-style notify callback so the approval system can
         # push the `approval` SSE event the moment a dangerous command is
@@ -10826,6 +10888,9 @@ def _run_agent_streaming(
                     return  # end-of-stream sentinel
                 if text:
                     _observe_runtime_model()
+                    if not _first_token_staged[0]:
+                        _first_token_staged[0] = True
+                        _turn_stage('first_token')
                 # #4729: visible output is starting — flush any buffered reasoning tail
                 # first so the live Thinking stream is complete before/at the transition.
                 _flush_reasoning_buffer()
@@ -11330,6 +11395,7 @@ def _run_agent_streaming(
                     )
                 except Exception as _e:
                     print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
+                _turn_stage('runtime_resolved')
 
                 # Named custom providers (custom:slug) may not be resolvable by
                 # hermes_cli.runtime_provider directly. Fall back to config.yaml
@@ -11948,10 +12014,12 @@ def _run_agent_streaming(
                         logger.debug("Periodic checkpoint save failed: %s", e)
 
             _checkpoint_stop = threading.Event()
+            _turn_stage('agent_ready')
             # Persist the user message BEFORE streaming starts so it's durable even if
             # the server crashes before the first checkpoint fires (every 15s).
             with _agent_lock:
                 s.save(touch_updated_at=True, skip_index=False)
+            _turn_stage('user_message_saved')
 
             _ckpt_thread = threading.Thread(
                 target=_periodic_checkpoint, daemon=True,
@@ -12048,7 +12116,9 @@ def _run_agent_streaming(
                     _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
                 put('cancel', _cancel_event_payload('Cancelled by user'))
                 return
+            _turn_stage('model_call')
             result = agent.run_conversation(**_run_conversation_kwargs)
+            _turn_stage('model_returned')
             _remember_pending_steer_result(result)
             _active_turn_identity = _resolve_active_turn_authority(
                 _active_turn_identity,
@@ -14257,17 +14327,12 @@ def _run_agent_streaming(
         _clear_thread_env()  # TD1: always clear thread-local context
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
-        if _restore_streaming_skill_home_modules and _streaming_skill_home_snapshot is not None:
-            with _ENV_LOCK:
-                if restore_skill_home_modules is not None:
-                    try:
-                        restore_skill_home_modules(_streaming_skill_home_snapshot)
-                    except Exception:
-                        logger.debug("Failed to restore skill module state for streaming profile", exc_info=True)
-                _streaming_skill_home_snapshot = None
-                _restore_streaming_skill_home_modules = False
         if _acquired_streaming_skill_home_patch_lock:
-            _SKILL_HOME_MODULE_PATCH_LOCK.release()
+            # The last lease holder out restores the skill-module globals.
+            try:
+                _SKILL_HOME_MODULE_PATCH_LOCK.release()
+            except Exception:
+                logger.debug("Failed to release skill-home lease for streaming profile", exc_info=True)
             _acquired_streaming_skill_home_patch_lock = False
         _reset_streaming_hermes_home_override(*_streaming_hermes_home_override_ctx)
         # xsession wakeup misroute root fix (Option 1): restore the per-turn
@@ -14276,6 +14341,7 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
+        _turn_stage('worker_end', tokens=bool(_first_token_staged[0]))
         # Close voice stage timing for this stream before taking registry locks.
         _voice.note_reply_end(stream_id)
         with STREAMS_LOCK:

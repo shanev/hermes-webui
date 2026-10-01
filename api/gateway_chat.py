@@ -1172,8 +1172,19 @@ def _run_gateway_chat_streaming(
     the configured Gateway API server into those local events and persists the
     final user/assistant turn back into the WebUI session.
     """
+    _turn_stage_t0 = time.monotonic()
+    _first_token_staged = [False]
+
+    def _turn_stage(stage, **extra):
+        try:
+            from api.streaming import log_turn_stage
+            log_turn_stage(stream_id, session_id, _turn_stage_t0, stage, backend="gateway", **extra)
+        except Exception:
+            pass
+
     q = peek_stream(stream_id)
     if q is None:
+        _turn_stage("worker_cancelled_before_start")
         _finish_gateway_run_starting(stream_id, result="fallback")
         _clear_gateway_run_starting(stream_id)
         # Cancelled before the worker started; release the owner entry the route
@@ -1194,6 +1205,7 @@ def _run_gateway_chat_streaming(
         provider=model_provider,
         backend="gateway",
     )
+    _turn_stage("worker_started")
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
@@ -1216,6 +1228,9 @@ def _run_gateway_chat_streaming(
             data = data.copy()
             data.setdefault("session_id", session_id)
         if event == "token" and isinstance(data, dict):
+            if data.get("text") and not _first_token_staged[0]:
+                _first_token_staged[0] = True
+                _turn_stage("first_token")
             # Voice stage timing (first_token / first_sentence); a single dict
             # miss for streams that are not an open voice turn.
             _voice.note_reply_text(stream_id, data.get("text"))
@@ -1426,7 +1441,9 @@ def _run_gateway_chat_streaming(
             update_active_run(stream_id, phase="gateway-request")
             last_payload = {}
             sse_event = "message"
+            _turn_stage("model_call")
             with urllib.request.urlopen(req, timeout=_gateway_read_timeout_secs()) as resp:
+                _turn_stage("gateway_connected")
                 for raw_line in _iter_sse_lines_cancellable(resp, cancel_event):
                     if cancel_event.is_set():
                         put_gateway_event("cancel", {"message": "Cancelled by user"})
@@ -1792,6 +1809,7 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)
+        _turn_stage("worker_end", tokens=bool(_first_token_staged[0]))
         # Close voice stage timing for this stream before taking registry locks.
         _voice.note_reply_end(stream_id)
         with STREAMS_LOCK:

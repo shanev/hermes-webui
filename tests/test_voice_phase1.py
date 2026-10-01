@@ -278,6 +278,89 @@ def test_chat_start_binds_the_voice_turn_to_the_accepted_stream():
     assert '_voice.bind_stream(body.get("voice_turn_id"), s.session_id, response["stream_id"])' in body
 
 
+# ── Truthful turn lines: unbound starts, silent clips, worker stage ─────────
+
+
+def test_rejected_voice_chat_start_is_logged_and_stamped_on_the_turn(log_lines):
+    turn_id = voice.begin_turn(None)
+
+    voice.record_chat_start(turn_id, SID, status=409, error="session already has an active stream")
+
+    (event,) = _events(log_lines, "voice_chat_start")
+    assert event["turn_id"] == turn_id
+    assert event["status"] == 409
+    assert event["reason"] == "rejected"
+    voice.close_turn(turn_id, "timeout")
+    (line,) = _events(log_lines, "voice_turn")
+    assert line["chat_start"] == {"status": 409, "bound": False}
+    assert line["stream_id"] is None
+
+
+def test_failed_bind_on_an_accepted_start_is_logged(log_lines):
+    turn_id = voice.begin_turn(SID)
+    assert voice.bind_stream(turn_id, SID, STREAM) is True
+
+    # A replayed start for the same turn cannot rebind it: say so.
+    rebound = voice.bind_stream(turn_id, SID, "another-stream")
+    voice.record_chat_start(turn_id, SID, status=200, stream_id="another-stream", bound=rebound)
+
+    (event,) = _events(log_lines, "voice_chat_start")
+    assert event["reason"] == "already_bound"
+
+
+def test_bound_start_is_quiet_and_a_timeout_line_names_the_worker_stage(monkeypatch, log_lines):
+    turn_id = voice.begin_turn(None)
+    assert voice.bind_stream(turn_id, SID, STREAM) is True
+    voice.record_chat_start(turn_id, SID, status=200, stream_id=STREAM, bound=True)
+    assert _events(log_lines, "voice_chat_start") == []
+    voice.note_worker_stage(STREAM, "skill_home_wait")
+
+    monkeypatch.setattr(voice, "_TURN_FLUSH_SECONDS", 0.0)
+    voice.begin_turn(None)  # the lazy sweep writes the stale turn's line
+
+    (line,) = [entry for entry in _events(log_lines, "voice_turn") if entry["turn_id"] == turn_id]
+    assert line["closed_by"] == "timeout"
+    assert line["worker_stage"] == "skill_home_wait"
+    assert line["chat_start"] == {"status": 200, "bound": True}
+    assert line["opened_at"].endswith("Z")
+
+
+def test_silent_clip_closes_its_turn_as_no_speech(monkeypatch, log_lines):
+    fake_mod = types.ModuleType("tools.transcription_tools")
+    fake_mod.transcribe_audio = lambda path: {"success": False, "no_speech": True, "error": "no speech"}
+    monkeypatch.setitem(sys.modules, "tools.transcription_tools", fake_mod)
+    tools_pkg = sys.modules.get("tools")
+    if tools_pkg is not None:
+        monkeypatch.setattr(tools_pkg, "transcription_tools", fake_mod, raising=False)
+    body, content_type = _multipart_body(
+        {"session_id": SID},
+        {"file": ("voice.webm", b"RIFFfakeaudio", "audio/webm")},
+    )
+    handler = _FakeHandler(body, content_type)
+
+    upload.handle_transcribe(handler)
+
+    assert handler.status == 200
+    payload = handler.payload()
+    assert payload["transcript"] == ""
+    (line,) = _events(log_lines, "voice_turn")
+    assert line["turn_id"] == payload["turn_id"]
+    assert line["closed_by"] == "no_speech"
+    # A later sweep never re-reports it as a stuck "timeout" turn.
+    monkeypatch.setattr(voice, "_TURN_FLUSH_SECONDS", 0.0)
+    voice.begin_turn(None)
+    assert len([e for e in _events(log_lines, "voice_turn") if e["turn_id"] == payload["turn_id"]]) == 1
+
+
+def test_chat_start_reports_unbound_voice_starts():
+    src = (REPO / "api" / "routes.py").read_text(encoding="utf-8")
+    start = src.index("def _handle_chat_start(handler, body, diag=None):")
+    body = src[start:src.index("def _resolve_chat_workspace_with_recovery", start)]
+
+    assert "_voice.record_chat_start(" in body
+    assert 'elif body.get("voice_turn_id"):' in body
+
+
 # ── POST /api/voice/metrics ─────────────────────────────────────────────────
 
 

@@ -25542,9 +25542,19 @@ def _handle_chat_start(handler, body, diag=None):
                 return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
         # Voice stage timing: attach the accepted stream to the client's voice
         # turn (the turn_id returned by /api/transcribe). Instrumentation only;
-        # an unknown or foreign turn is ignored.
+        # an unknown or foreign turn is ignored, but an unbound outcome (failed
+        # bind or rejected start) is logged so the turn line stays truthful.
         if status == 200 and body.get("voice_turn_id") and response.get("stream_id"):
-            _voice.bind_stream(body.get("voice_turn_id"), s.session_id, response["stream_id"])
+            _voice_bound = _voice.bind_stream(body.get("voice_turn_id"), s.session_id, response["stream_id"])
+            _voice.record_chat_start(
+                body.get("voice_turn_id"), s.session_id, status=status,
+                stream_id=response["stream_id"], bound=_voice_bound,
+            )
+        elif body.get("voice_turn_id"):
+            _voice.record_chat_start(
+                body.get("voice_turn_id"), s.session_id, status=status,
+                stream_id=response.get("stream_id"), error=response.get("error"),
+            )
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:
