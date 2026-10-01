@@ -9472,7 +9472,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         if active_provider and active_provider != "custom" and not _has_custom_providers:
             detected_providers.discard("custom")
             for _slug in list(detected_providers):
-                if _slug.startswith("custom:") and not _has_custom_providers:
+                # Never discard the active provider itself: a named custom
+                # provider (e.g. ``custom:modelrelay`` from providers:) that is
+                # also the active provider must keep its discovered group even
+                # without a custom_providers[] entry — discarding it collapsed
+                # the picker to the one-model "Default" fallback (#modelrelay).
+                if _slug.startswith("custom:") and _slug != active_provider and not _has_custom_providers:
                     detected_providers.discard(_slug)
         elif active_provider == "custom" and _has_custom_providers:
             _has_unnamed = any(
@@ -9621,6 +9626,21 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                 models_endpoint_error=_named_custom_errors.get(pid),
                                 apply_prefix=False,
                             )
+                    elif pid == active_provider and auto_detected_models_by_provider.get(pid):
+                        # Active custom:* provider discovered via model.base_url
+                        # (providers.<name>.api / key_cmd config shape) has no
+                        # custom_providers[] entry, so _named_custom_groups never
+                        # saw it — but its /v1/models probe succeeded and the
+                        # models are sitting in auto_detected_models_by_provider.
+                        # Emit them instead of dropping the group: dropping
+                        # collapsed the picker to the one-model "Default"
+                        # fallback (#Hark-modelrelay-picker).
+                        _append_picker_group(
+                            _effective_provider_display_name(pid, _PROVIDER_DISPLAY),
+                            pid,
+                            auto_detected_models_by_provider[pid],
+                            apply_prefix=False,
+                        )
                     continue
                 provider_name = _effective_provider_display_name(pid, _PROVIDER_DISPLAY)
                 if pid == "openrouter":
