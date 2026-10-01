@@ -9,7 +9,8 @@ log.
 
 State layer: process-local, in-memory, bounded. Nothing here is persisted and
 nothing here is authoritative for run state — cancellation stays in
-``api.streaming.cancel_stream`` and the active-run registry. A restart drops
+``api.streaming.cancel_stream`` and the active-run registry, and consumer
+detachment and the turn deadline live in ``api.turn_liveness``. A restart drops
 open turns and armed turn notes (the barge-in note and the voice-mode
 directive); both degrade to "no instrumentation" and a chat-formatted reply.
 
@@ -146,6 +147,8 @@ def _turn_line_locked(rec: dict, closed_by: str) -> str:
         payload["client_stages"] = dict(rec["client"])
     if rec["interrupted"]:
         payload["truncated_chars"] = int(rec["truncated_chars"] or 0)
+    if rec.get("detached"):
+        payload["detached"] = True
     return _log_line(payload)
 
 
@@ -428,6 +431,41 @@ def record_interrupt(session_id, turn_id, *, truncated_chars: int, cancelled: bo
         "cancelled": bool(cancelled),
         "truncated_chars": truncated_chars,
     }))
+    _emit(lines)
+
+
+def _turn_for_stream_locked(stream_id):
+    """Newest turn bound to ``stream_id``, or None. Caller holds _LOCK."""
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return None
+    for rec in reversed(_TURNS.values()):
+        if rec["stream_id"] == stream_id:
+            return rec
+    return None
+
+
+def note_stream_detached(stream_id) -> None:
+    """Flag the turn on ``stream_id`` as having lost its SSE consumer (sticky).
+
+    Run state lives in ``api.turn_liveness``; this only marks the log line.
+    """
+    with _LOCK:
+        rec = _turn_for_stream_locked(stream_id)
+        if rec is not None:
+            rec["detached"] = True
+
+
+def close_turn_for_stream(stream_id, closed_by: str) -> None:
+    """Write the line for the turn on ``stream_id`` now, if still open."""
+    lines = []
+    with _LOCK:
+        rec = _turn_for_stream_locked(stream_id)
+        if rec is not None:
+            if _AWAITING_REPLY.get(rec["stream_id"]) == rec["turn_id"]:
+                _AWAITING_REPLY.pop(rec["stream_id"], None)
+            if not rec["emitted"]:
+                lines.append(_turn_line_locked(rec, closed_by))
     _emit(lines)
 
 

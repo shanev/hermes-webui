@@ -1098,21 +1098,26 @@ def _clarify_timeout_seconds(config: dict | None = None, default: int = 3600) ->
         return int(default)
 
 
-def _await_clarify_response(entry, timeout, cancel_evt) -> tuple[str, bool]:
+def _await_clarify_response(entry, timeout, cancel_evt, abandoned=None) -> tuple[str, bool]:
     """Block until a clarify entry resolves, or (finite timeout only) expires.
 
     ``timeout <= 0`` means *unlimited*: no deadline — the prompt waits until
     the user answers or the run is cancelled.  Polls the entry's event in ~1s
     slices so a cancelled run unblocks promptly, and still honours the
-    ``is_interrupted``-style cancel check each slice.
+    ``is_interrupted``-style cancel check each slice.  ``abandoned`` (optional
+    callable) ends the wait the same way when nobody is left who could answer
+    (a voice turn whose consumer died, api/turn_liveness.py).
 
     Returns ``(response, expired)``: ``expired`` is True when it returned
-    because of cancellation or a finite timeout without a user response (the
-    caller should clear pending and fall back), False when the user answered.
+    because of cancellation, abandonment or a finite timeout without a user
+    response (the caller should clear pending and fall back), False when the
+    user answered.
     """
     deadline = None if timeout <= 0 else time.monotonic() + timeout
     while True:
         if cancel_evt.is_set():
+            return "", True
+        if abandoned is not None and abandoned():
             return "", True
         wait_for = 1.0
         if deadline is not None:
@@ -10687,7 +10692,11 @@ def _run_agent_streaming(
                 )
 
             entry = _submit_clarify_pending(sid, data)
-            response, expired = _await_clarify_response(entry, timeout, cancel_evt)
+            from api.turn_liveness import voice_prompt_abandoned
+            response, expired = _await_clarify_response(
+                entry, timeout, cancel_evt,
+                abandoned=lambda: voice_prompt_abandoned(stream_id),
+            )
             if expired:
                 _clear_clarify_pending(sid)
             return (

@@ -10919,6 +10919,11 @@ class StreamChannel:
             except ValueError:
                 pass
 
+    def subscriber_count(self) -> int:
+        """Number of attached SSE subscribers (api.turn_liveness detach check)."""
+        with self._lock:
+            return len(self._subscribers)
+
     def note_last_event_id(self, event_id: str | None) -> None:
         """Record the latest journal event id without changing the queue shape."""
         if not event_id:
@@ -11330,12 +11335,16 @@ def active_run_cancel_is_stale(
     so a long-running turn that was just cancelled is never mistaken for an
     orphan; ``started_at`` remains the fallback for rows created before the
     cancellation timestamp existed. Callers own the grace window because the
-    tolerated unwind differs per surface.
+    tolerated unwind differs per surface. A cancel issued by the turn deadline
+    (``closed_by="deadline"``, api.turn_liveness) has no further grace: the
+    deadline already was it.
     """
     if not isinstance(run_entry, dict):
         return False
     if str(run_entry.get("phase") or "").strip() != "cancelling":
         return False
+    if run_entry.get("closed_by") == "deadline":
+        return True
     anchor = run_entry.get("cancelled_at") or run_entry.get("started_at")
     if not anchor:
         return False

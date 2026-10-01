@@ -11284,6 +11284,7 @@ from api.streaming import (
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
 from api import tts_sanitize as _tts_sanitize
 from api import voice as _voice
+from api import turn_liveness as _turn_liveness
 from api.run_journal import (
     runtime_model_from_events,
     _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
@@ -19668,6 +19669,7 @@ def _handle_sse_stream(handler, parsed):
     else:
         subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
         stream_snapshot = {}
+    _turn_liveness.note_consumer_attached(stream_id)
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
@@ -19709,7 +19711,18 @@ def _handle_sse_stream(handler, parsed):
             if event in SSE_RELAY_CLOSE_EVENTS:
                 break
     except _CLIENT_DISCONNECT_ERRORS:
-        pass
+        # The client is gone, not the turn: drop this subscriber now and mark
+        # the run detached if it was the last one (api/turn_liveness.py). The
+        # worker keeps running; finally's second unsubscribe is a no-op.
+        if subscriber is not stream and hasattr(stream, "unsubscribe"):
+            try:
+                stream.unsubscribe(subscriber)
+            except Exception:
+                pass
+        try:
+            _turn_liveness.note_consumer_lost(stream_id, stream)
+        except Exception:
+            logger.debug("Failed to mark stream %s detached", stream_id, exc_info=True)
     finally:
         if subscriber is not stream and hasattr(stream, "unsubscribe"):
             try:
@@ -19747,6 +19760,7 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
     active_stream_id = _active_run_stream_for_session(session_id)
     subscriber = None
     subscriber_stream = None
+    consumer_lost = False  # see _handle_sse_stream / api/turn_liveness.py
     replay_cutoff_seq = None
     sent_event_ids: set[str] = set()
     sent_event_order = deque()
@@ -19823,6 +19837,7 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
                 time.sleep(_SSE_HEARTBEAT_INTERVAL_SECONDS)
         if subscriber is None:
             return True
+        _turn_liveness.note_consumer_attached(active_stream_id)
         if replay_ok:
             replay_cutoff_seq = _run_journal_same_run_seq(str(stream_snapshot.get("last_event_id") or ""), active_stream_id)
             reconciled = read_session_run_events(session_id, after_event_id=resume_event_id)
@@ -19866,15 +19881,20 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
                 if _is_terminal:
                     break
         except _CLIENT_DISCONNECT_ERRORS:
-            pass
+            consumer_lost = True
     except _CLIENT_DISCONNECT_ERRORS:
-        pass
+        consumer_lost = True
     finally:
         if subscriber is not None and subscriber is not subscriber_stream and hasattr(subscriber_stream, "unsubscribe"):
             try:
                 subscriber_stream.unsubscribe(subscriber)
             except Exception:
                 pass
+        if consumer_lost and subscriber is not None:
+            try:
+                _turn_liveness.note_consumer_lost(active_stream_id, subscriber_stream)
+            except Exception:
+                logger.debug("Failed to mark stream %s detached", active_stream_id, exc_info=True)
     return True
 
 
@@ -24323,6 +24343,9 @@ def _start_chat_stream_for_session(
     # Bound to stream_id: if this turn never drains it, no later turn can.
     if voice_mode:
         _voice.arm_voice_mode_note(s.session_id, stream_id)
+        # Hard deadline: a wedged voice turn is force-finalized, never left
+        # owning the session (api/turn_liveness.py, hark#13).
+        _turn_liveness.track_voice_stream(stream_id)
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),

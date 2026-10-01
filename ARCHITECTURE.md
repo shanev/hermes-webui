@@ -72,6 +72,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
       voice.py             Voice-turn stage timing log + one-shot turn notes: barge-in, voice mode (in-memory)
+      turn_liveness.py     SSE consumer detach marker, detached voice-prompt fallback, voice-turn hard deadline
       workspace.py         File ops: list_dir, read_file_content, git detection, workspace helpers
     static/
       index.html           HTML template
@@ -1580,6 +1581,35 @@ barge-in, or once the turn is 120 s old.
                                to a finished stream never stops the session's newer run.
                                The session's next user turn carries a one-shot, model-only
                                note that the previous spoken reply was interrupted.
+
+#### Turn liveness: detached consumers and the voice-turn deadline
+
+`api/turn_liveness.py` (hark#13). The worker's SSE path never blocks:
+it journals each event and calls `StreamChannel.put_nowait` (bounded,
+drop-oldest), and only the handler thread writes to the socket. So a dead client
+can't raise into or stall the agent loop. Three things keep a turn from
+outliving its client:
+
+- **Detached.** When a chat/session SSE handler's write fails
+  (`_CLIENT_DISCONNECT_ERRORS`) and no other subscriber remains, the run's
+  `ACTIVE_RUNS` row gets `consumer="detached"` and `detached_at`. A reattach sets
+  it back to `"attached"`. `phase` is unchanged. The turn keeps running and
+  persists normally. A voice turn's log line gains `"detached": true`. A normal
+  turn never gets the marker.
+- **Voice prompts.** A clarify prompt on a voice turn detached for more than 60 s
+  stops waiting and returns the usual "no response, use your best judgement"
+  fallback, so the tool loop finishes. Desktop turns keep waiting for a tab to
+  come back.
+- **Deadline.** A voice-originated turn (one with a `voice_turn_id`) older than
+  `HERMES_WEBUI_VOICE_TURN_DEADLINE` seconds (default 600; invalid or `<= 0`
+  falls back to 600) is force-finalized once by a background reaper. It goes
+  through the Stop path (Gateway stop, then `cancel_stream` / runtime adapter),
+  which persists the partial reply plus the cancel marker. The row is stamped
+  `closed_by="deadline"`, which the chat/start stale-cancel check treats as
+  immediately stale. If the worker hasn't unwound within 5 s, its row, stream
+  maps and cached Agent are released, so a retry is admitted at once. The
+  wedged worker's late result is rejected by the writeback guard. The turn's log
+  line closes with `closed_by: "deadline"`. Typed turns have no deadline.
 
 ### GET Endpoints Added in Sprint 3
 
